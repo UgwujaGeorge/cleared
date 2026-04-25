@@ -1,6 +1,7 @@
 {
   "license": "ISC",
   "scripts": {
+    "test:clean": "arcium clean && arcium test",
     "lint:fix": "prettier */*.js \"*/**/*{.js,.ts}\" -w",
     "lint": "prettier */*.js \"*/**/*{.js,.ts}\" --check"
   },

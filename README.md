@@ -44,9 +44,11 @@ Build requires Rust 1.89.0 (pinned via `rust-toolchain.toml`), Solana CLI 2.3+, 
 
 ```bash
 arcium build       # build circuits + program
-arcium test        # integration tests on localnet
+yarn test:clean    # integration tests on localnet — safe-default
 cd app && yarn dev # frontend dev server
 ```
+
+`yarn test:clean` runs `arcium clean && arcium test`. Use it instead of bare `arcium test`: the bare command's encrypted-ixs hash check can keep a stale circuit binary in place after source edits, leaving the on-chain comp-def CU count out of sync with what the Arx nodes parse — the MPC then aborts before any callback runs. Cleaning first avoids the trap; cost is one extra rebuild per run.
 
 Dev/demo instructions will be expanded in later phases.
 
