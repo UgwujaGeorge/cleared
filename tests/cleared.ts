@@ -1,6 +1,11 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
-import { PublicKey, Keypair, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import {
+  PublicKey,
+  Keypair,
+  LAMPORTS_PER_SOL,
+  SystemProgram,
+} from "@solana/web3.js";
 import { Cleared } from "../target/types/cleared";
 import { randomBytes } from "crypto";
 import {
@@ -48,6 +53,7 @@ describe("Cleared", () => {
       await initCompDef(program, owner, name);
       console.log(`  comp def ready: ${name}`);
     }
+    await probeCompDefImmutability(owner, "init_bid_book");
 
     // 2. Fetch MXE pubkey with retry (arx nodes may take time to initialize).
     const mxePublicKey = await getMXEPublicKeyWithRetry(
@@ -341,6 +347,98 @@ describe("Cleared", () => {
       .rpc({ commitment: "confirmed" });
 
     console.log(`  using off-chain circuit source for ${circuit}`);
+  }
+
+  async function probeCompDefImmutability(
+    owner: anchor.web3.Keypair,
+    circuit: CircuitName
+  ): Promise<void> {
+    console.log(`Probing comp-def immutability: ${circuit}`);
+    const offsetBytes = getCompDefAccOffset(circuit);
+    const offset = Buffer.from(offsetBytes).readUInt32LE();
+    const mxeAccount = getMXEAccAddress(program.programId);
+    const mxeAcc = await arciumProgram.account.mxeAccount.fetch(mxeAccount);
+    const lutAddress = getLookupTableAddress(
+      program.programId,
+      mxeAcc.lutOffsetSlot
+    );
+    const compDefPda = getCompDefAccAddress(program.programId, offset);
+    const compDef =
+      (await arciumProgram.account.computationDefinitionAccount.fetch(
+        compDefPda
+      )) as any;
+
+    const sameSource = cloneSource(compDef.circuitSource);
+    const wrongHash = cloneSource(compDef.circuitSource);
+    wrongHash.offChain[0].hash[0] = wrongHash.offChain[0].hash[0] ^ 1;
+    const differentUrl = cloneSource(compDef.circuitSource);
+    differentUrl.offChain[0].source = `${differentUrl.offChain[0].source}?immutability_probe=1`;
+
+    const scenarios = [
+      ["same hash + same URL", sameSource],
+      ["different hash + same URL", wrongHash],
+      ["same hash + different URL", differentUrl],
+    ] as const;
+
+    for (const [label, source] of scenarios) {
+      const result = await tryInitComputationDefinition(
+        owner,
+        offset,
+        mxeAccount,
+        lutAddress,
+        compDefPda,
+        compDef,
+        source
+      );
+      console.log(`  ${label}: ${result}`);
+    }
+  }
+
+  async function tryInitComputationDefinition(
+    owner: anchor.web3.Keypair,
+    offset: number,
+    mxeAccount: PublicKey,
+    lutAddress: PublicKey,
+    compDefPda: PublicKey,
+    compDef: any,
+    source: any
+  ): Promise<string> {
+    try {
+      const sig = await arciumProgram.methods
+        .initComputationDefinition(
+          offset,
+          program.programId,
+          compDef.definition,
+          source,
+          compDef.cuAmount,
+          compDef.finalizationAuthority ?? null
+        )
+        .accounts({
+          signer: owner.publicKey,
+          mxe: mxeAccount,
+          addressLookupTable: lutAddress,
+          compDefAcc: compDefPda,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([owner])
+        .rpc({ skipPreflight: false, commitment: "confirmed" });
+      return `accepted (${sig})`;
+    } catch (e: any) {
+      const message = e.message ?? String(e);
+      const usefulLog = [...(e.logs ?? [])]
+        .reverse()
+        .find(
+          (line: string) =>
+            !line.includes("Instruction: InitComputationDefinition") &&
+            !line.includes("invoke") &&
+            !line.includes("consumed")
+        );
+      return `rejected (${usefulLog ?? message})`;
+    }
+  }
+
+  function cloneSource(source: any): any {
+    return JSON.parse(JSON.stringify(source));
   }
 });
 
