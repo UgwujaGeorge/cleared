@@ -10,6 +10,8 @@ import {
   getArciumAccountBaseSeed,
   getArciumProgramId,
   getArciumProgram,
+  getFeePoolAccAddress,
+  getClockAccAddress,
   uploadCircuit,
   RescueCipher,
   deserializeLE,
@@ -51,7 +53,7 @@ describe("Cleared", () => {
     // 2. Fetch MXE pubkey with retry (arx nodes may take time to initialize).
     const mxePublicKey = await getMXEPublicKeyWithRetry(
       provider,
-      program.programId,
+      program.programId
     );
     console.log("MXE x25519 pubkey fetched");
 
@@ -59,7 +61,7 @@ describe("Cleared", () => {
     const auctionId = new anchor.BN(randomBytes(8), "hex");
     const [auctionPda] = PublicKey.findProgramAddressSync(
       [Buffer.from("auction"), auctionId.toArrayLike(Buffer, "le", 8)],
-      program.programId,
+      program.programId
     );
 
     // 4. create_auction -> init_bid_book.
@@ -69,8 +71,8 @@ describe("Cleared", () => {
     if (solanaNow === null) throw new Error("Failed to read validator clock");
     const now = solanaNow;
     const opensAt = new anchor.BN(now - 5); // already open
-    // Each MPC round-trip takes ~20-30s on localnet (init + N bids). Give us headroom.
-    const closesAt = new anchor.BN(now + 300);
+    // Each MPC round-trip takes ~20-30s on localnet (init + 3 bids).
+    const closesAt = new anchor.BN(now + 90);
     const totalSupply = new anchor.BN(1000);
 
     console.log("Creating auction...");
@@ -83,13 +85,17 @@ describe("Cleared", () => {
         new anchor.BN(0), // min_price
         new anchor.BN(0), // max_bid_per_wallet (0 = no cap)
         opensAt,
-        closesAt,
+        closesAt
       )
       .accountsPartial({
         payer: owner.publicKey,
         issuer: owner.publicKey,
         auction: auctionPda,
-        ...arciumQueueAccounts(program.programId, createOffset, "init_bid_book"),
+        ...arciumQueueAccounts(
+          program.programId,
+          createOffset,
+          "init_bid_book"
+        ),
       })
       .signers([owner])
       .rpc({ skipPreflight: false, commitment: "confirmed" });
@@ -99,20 +105,24 @@ describe("Cleared", () => {
       provider,
       createOffset,
       program.programId,
-      "confirmed",
+      "confirmed"
     );
-    console.log(`  finalize ret = ${JSON.stringify(finalizeRet) ?? "undefined"}`);
+    console.log(
+      `  finalize ret = ${JSON.stringify(finalizeRet) ?? "undefined"}`
+    );
 
     const a0 = await program.account.auction.fetch(auctionPda);
     const nonceHex = Buffer.from(a0.encryptedBidBookNonce).toString("hex");
     const bookAllZero = a0.encryptedBidBook.every((ct) =>
-      ct.every((b: number) => b === 0),
+      ct.every((b: number) => b === 0)
     );
     console.log(`  status         = ${JSON.stringify(a0.status)}`);
     console.log(`  bid_count      = ${a0.bidCount}`);
     console.log(`  bid_book_nonce = ${nonceHex}`);
     console.log(
-      `  bid_book[0..8] = ${Buffer.from(a0.encryptedBidBook[0]).slice(0, 8).toString("hex")}`,
+      `  bid_book[0..8] = ${Buffer.from(a0.encryptedBidBook[0])
+        .slice(0, 8)
+        .toString("hex")}`
     );
     console.log(`  bid_book all-zero? ${bookAllZero}`);
 
@@ -122,11 +132,12 @@ describe("Cleared", () => {
       {
         commitment: "confirmed",
         maxSupportedTransactionVersion: 0,
-      },
+      }
     );
     console.log(`    err = ${JSON.stringify(finalizeTx?.meta?.err ?? null)}`);
     if (finalizeTx?.meta?.logMessages) {
-      for (const line of finalizeTx.meta.logMessages) console.log(`      ${line}`);
+      for (const line of finalizeTx.meta.logMessages)
+        console.log(`      ${line}`);
     }
 
     // 5. Submit 3 bids with distinct bidders.
@@ -147,7 +158,7 @@ describe("Cleared", () => {
       // Fund bidder so they can pay account creation rent.
       const fundTx = await provider.connection.requestAirdrop(
         kp.publicKey,
-        LAMPORTS_PER_SOL,
+        LAMPORTS_PER_SOL
       );
       await provider.connection.confirmTransaction(fundTx, "confirmed");
 
@@ -166,12 +177,12 @@ describe("Cleared", () => {
           auctionId.toArrayLike(Buffer, "le", 8),
           kp.publicKey.toBuffer(),
         ],
-        program.programId,
+        program.programId
       );
 
       const submitOffset = new anchor.BN(randomBytes(8), "hex");
       console.log(
-        `Submitting bid ${i} (${b.name}: ${b.quantity} @ ${b.price})...`,
+        `Submitting bid ${i} (${b.name}: ${b.quantity} @ ${b.price})...`
       );
       await program.methods
         .submitBid(
@@ -179,7 +190,7 @@ describe("Cleared", () => {
           Array.from(ct[0]),
           Array.from(ct[1]),
           Array.from(bidderPub),
-          new anchor.BN(deserializeLE(nonce).toString()),
+          new anchor.BN(deserializeLE(nonce).toString())
         )
         .accountsPartial({
           payer: owner.publicKey,
@@ -196,7 +207,7 @@ describe("Cleared", () => {
         provider,
         submitOffset,
         program.programId,
-        "confirmed",
+        "confirmed"
       );
       console.log(`  Bid ${i} accepted`);
     }
@@ -221,7 +232,7 @@ describe("Cleared", () => {
         ...arciumQueueAccounts(
           program.programId,
           closeOffset,
-          "compute_clearing",
+          "compute_clearing"
         ),
       })
       .signers([owner])
@@ -232,7 +243,7 @@ describe("Cleared", () => {
       provider,
       closeOffset,
       program.programId,
-      "confirmed",
+      "confirmed"
     );
 
     // 8. Verify clearing result.
@@ -242,7 +253,9 @@ describe("Cleared", () => {
     console.log(`  bid_count      = ${auction.bidCount}`);
     console.log(`  clearing_price = ${auction.clearingPrice.toString()}`);
     console.log(
-      `  allocations    = [${auction.allocations.map((a) => a.toString()).join(", ")}]`,
+      `  allocations    = [${auction.allocations
+        .map((a) => a.toString())
+        .join(", ")}]`
     );
     console.log(`  total_sold     = ${auction.totalSold.toString()}`);
 
@@ -259,12 +272,12 @@ describe("Cleared", () => {
   function arciumQueueAccounts(
     programId: PublicKey,
     offset: anchor.BN,
-    circuit: CircuitName,
+    circuit: CircuitName
   ) {
     return {
       computationAccount: getComputationAccAddress(
         arciumEnv.arciumClusterOffset,
-        offset,
+        offset
       ),
       clusterAccount,
       mxeAccount: getMXEAccAddress(programId),
@@ -272,21 +285,27 @@ describe("Cleared", () => {
       executingPool: getExecutingPoolAccAddress(arciumEnv.arciumClusterOffset),
       compDefAccount: getCompDefAccAddress(
         programId,
-        Buffer.from(getCompDefAccOffset(circuit)).readUInt32LE(),
+        Buffer.from(getCompDefAccOffset(circuit)).readUInt32LE()
       ),
+      // Explicit: Anchor's accountsPartial resolver auto-fills these from the
+      // IDL `address` constants on most ixs but not `submit_bid` (likely an
+      // ordering / init-account interaction). Passing them explicitly works
+      // for all three ixs and avoids the surprise.
+      poolAccount: getFeePoolAccAddress(),
+      clockAccount: getClockAccAddress(),
     };
   }
 
   async function initCompDef(
     program: Program<Cleared>,
     owner: anchor.web3.Keypair,
-    circuit: CircuitName,
+    circuit: CircuitName
   ): Promise<void> {
     const baseSeed = getArciumAccountBaseSeed("ComputationDefinitionAccount");
     const offset = getCompDefAccOffset(circuit);
     const compDefPda = PublicKey.findProgramAddressSync(
       [baseSeed, program.programId.toBuffer(), offset],
-      getArciumProgramId(),
+      getArciumProgramId()
     )[0];
 
     // Idempotency: skip if already initialized.
@@ -300,7 +319,7 @@ describe("Cleared", () => {
     const mxeAcc = await arciumProgram.account.mxeAccount.fetch(mxeAccount);
     const lutAddress = getLookupTableAddress(
       program.programId,
-      mxeAcc.lutOffsetSlot,
+      mxeAcc.lutOffsetSlot
     );
 
     const methodName = (
@@ -311,7 +330,8 @@ describe("Cleared", () => {
       } as const
     )[circuit];
 
-    await (program.methods as any)[methodName]()
+    await (program.methods as any)
+      [methodName]()
       .accounts({
         compDefAccount: compDefPda,
         payer: owner.publicKey,
@@ -333,7 +353,7 @@ describe("Cleared", () => {
         skipPreflight: true,
         preflightCommitment: "confirmed",
         commitment: "confirmed",
-      },
+      }
     );
   }
 });
@@ -342,7 +362,7 @@ async function getMXEPublicKeyWithRetry(
   provider: anchor.AnchorProvider,
   programId: PublicKey,
   maxRetries: number = 20,
-  retryDelayMs: number = 500,
+  retryDelayMs: number = 500
 ): Promise<Uint8Array> {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -356,13 +376,13 @@ async function getMXEPublicKeyWithRetry(
     }
   }
   throw new Error(
-    `Failed to fetch MXE public key after ${maxRetries} attempts`,
+    `Failed to fetch MXE public key after ${maxRetries} attempts`
   );
 }
 
 function readKpJson(path: string): anchor.web3.Keypair {
   const file = fs.readFileSync(path);
   return anchor.web3.Keypair.fromSecretKey(
-    new Uint8Array(JSON.parse(file.toString())),
+    new Uint8Array(JSON.parse(file.toString()))
   );
 }

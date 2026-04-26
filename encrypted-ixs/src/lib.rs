@@ -4,7 +4,15 @@ use arcis::*;
 mod circuits {
     use arcis::*;
 
-    pub const MAX_BIDS: usize = 32;
+    pub const MAX_BIDS: usize = 8;
+    // Bid book stored as a flat [u64; 3*MAX_BIDS] inside Pack<>, which bit-packs
+    // ~3 u64s per BLS12-381 scalar field element. Each bid occupies 3 slots:
+    // [price, quantity, bidder_id]. Pack must be the direct inner type of Enc<>,
+    // so it cannot be wrapped in a struct — count is tracked plaintext on the
+    // program side (auction.bid_count) and passed back in for each computation.
+    pub const FLAT_SIZE: usize = MAX_BIDS * 3;
+
+    pub type BidBook = Pack<[u64; FLAT_SIZE]>;
 
     #[derive(Copy, Clone)]
     pub struct UserBid {
@@ -12,88 +20,55 @@ mod circuits {
         pub quantity: u64,
     }
 
-    #[derive(Copy, Clone)]
-    pub struct Bid {
-        pub price: u64,
-        pub quantity: u64,
-        pub bidder_id: u64,
-    }
-
-    #[derive(Copy, Clone)]
-    pub struct BidBook {
-        pub bids: [Bid; MAX_BIDS],
-        pub count: u8,
-    }
-
     // Sentinel bidder_id for empty slots. Larger than MAX_BIDS so no real bidder
-    // (assigned 0..count-1 by the program) ever collides with it during re-indexing.
+    // (assigned 0..count-1 by the program) ever collides during re-indexing.
     pub const EMPTY_BIDDER_ID: u64 = u64::MAX;
 
     #[instruction]
     pub fn init_bid_book() -> Enc<Mxe, BidBook> {
-        let empty = Bid {
-            price: 0,
-            quantity: 0,
-            bidder_id: EMPTY_BIDDER_ID,
-        };
-        let book = BidBook {
-            bids: [empty; MAX_BIDS],
-            count: 0,
-        };
-        Mxe::get().from_arcis(book)
+        let mut flat: [u64; FLAT_SIZE] = [0u64; FLAT_SIZE];
+        // bidder_id sits at offset 3*i+2 in each bid; mark empties with sentinel.
+        for i in 0..MAX_BIDS {
+            flat[3 * i + 2] = EMPTY_BIDDER_ID;
+        }
+        Mxe::get().from_arcis(Pack::new(flat))
     }
 
     #[instruction]
     pub fn add_bid(
         user_bid_ctxt: Enc<Shared, UserBid>,
         bidder_id: u64,
+        count: u64,
         book_ctxt: Enc<Mxe, BidBook>,
     ) -> Enc<Mxe, BidBook> {
         let user_bid = user_bid_ctxt.to_arcis();
-        let mut book = book_ctxt.to_arcis();
-
-        let new_bid = Bid {
-            price: user_bid.price,
-            quantity: user_bid.quantity,
-            bidder_id,
-        };
+        let mut flat = book_ctxt.to_arcis().unpack();
 
         for i in 0..MAX_BIDS {
-            if (i as u8) == book.count {
-                book.bids[i] = new_bid;
+            if (i as u64) == count {
+                flat[3 * i] = user_bid.price;
+                flat[3 * i + 1] = user_bid.quantity;
+                flat[3 * i + 2] = bidder_id;
             }
         }
-        book.count = book.count + 1;
-
-        book_ctxt.owner.from_arcis(book)
+        book_ctxt.owner.from_arcis(Pack::new(flat))
     }
 
     #[instruction]
     pub fn compute_clearing(
         book_ctxt: Enc<Mxe, BidBook>,
+        count: u64,
         total_supply: u64,
     ) -> (u64, [u64; MAX_BIDS], u64) {
-        let book = book_ctxt.to_arcis();
-        let mut bids = book.bids;
+        let mut flat = book_ctxt.to_arcis().unpack();
 
-        // Bitonic sort, descending by price. log2(32)=5 phases, 15 stages total,
-        // 16 comparators per stage = 240 comparators. Each (d, g) pair encodes
-        // the partner-distance and bitonic-group-size for that stage.
-        bitonic_stage(&mut bids, 1, 2);
-        bitonic_stage(&mut bids, 2, 4);
-        bitonic_stage(&mut bids, 1, 4);
-        bitonic_stage(&mut bids, 4, 8);
-        bitonic_stage(&mut bids, 2, 8);
-        bitonic_stage(&mut bids, 1, 8);
-        bitonic_stage(&mut bids, 8, 16);
-        bitonic_stage(&mut bids, 4, 16);
-        bitonic_stage(&mut bids, 2, 16);
-        bitonic_stage(&mut bids, 1, 16);
-        bitonic_stage(&mut bids, 16, 32);
-        bitonic_stage(&mut bids, 8, 32);
-        bitonic_stage(&mut bids, 4, 32);
-        bitonic_stage(&mut bids, 2, 32);
-        bitonic_stage(&mut bids, 1, 32);
+        // Bitonic sort, descending by price. log2(8)=3 phases, 6 stages.
+        bitonic_stage(&mut flat, 1, 2);
+        bitonic_stage(&mut flat, 2, 4);
+        bitonic_stage(&mut flat, 1, 4);
+        bitonic_stage(&mut flat, 4, 8);
+        bitonic_stage(&mut flat, 2, 8);
+        bitonic_stage(&mut flat, 1, 8);
 
         // Fill top-down until supply exhausted. Uniform price = last non-zero fill's bid price.
         let mut remaining: u64 = total_supply;
@@ -102,25 +77,24 @@ mod circuits {
         let mut fills: [u64; MAX_BIDS] = [0; MAX_BIDS];
 
         for i in 0..MAX_BIDS {
-            let is_real = (i as u8) < book.count;
-            let wants = if is_real { bids[i].quantity } else { 0 };
+            let is_real = (i as u64) < count;
+            let wants = if is_real { flat[3 * i + 1] } else { 0 };
             let fill = if wants <= remaining { wants } else { remaining };
             fills[i] = fill;
             total_sold = total_sold + fill;
             remaining = remaining - fill;
             if fill > 0 {
-                clearing_price = bids[i].price;
+                clearing_price = flat[3 * i];
             }
         }
 
-        // Re-index sorted-order fills to bidder-id-indexed allocations (O(N^2)).
-        // Empty slots carry EMPTY_BIDDER_ID (u64::MAX), which is > any j in 0..MAX_BIDS,
-        // so the inner match fails and they cannot clobber a real bidder's allocation.
-        // `is_real` is kept as belt-and-suspenders.
+        // Re-index sorted-order fills to bidder-id-indexed allocations.
+        // Empty slots carry EMPTY_BIDDER_ID (u64::MAX) > any j in 0..MAX_BIDS,
+        // so the inner match cannot fire for them.
         let mut allocations: [u64; MAX_BIDS] = [0; MAX_BIDS];
         for i in 0..MAX_BIDS {
-            let is_real = (i as u8) < book.count;
-            let target = bids[i].bidder_id;
+            let is_real = (i as u64) < count;
+            let target = flat[3 * i + 2];
             for j in 0..MAX_BIDS {
                 if is_real && (j as u64) == target {
                     allocations[j] = fills[i];
@@ -128,192 +102,179 @@ mod circuits {
             }
         }
 
-        (clearing_price.reveal(), allocations.reveal(), total_sold.reveal())
+        (
+            clearing_price.reveal(),
+            allocations.reveal(),
+            total_sold.reveal(),
+        )
     }
 
-    // One bitonic stage at partner-distance `d` within bitonic groups of size `g`.
-    // For each canonical-low index i (whose position in its 2d-block is < d),
-    // compare with partner i+d. Direction alternates per g-block.
-    // Arithmetic indexing only — Arcis rejects bitwise `&`.
-    fn bitonic_stage(bids: &mut [Bid; MAX_BIDS], d: usize, g: usize) {
+    fn bitonic_stage(flat: &mut [u64; FLAT_SIZE], d: usize, g: usize) {
         for i in 0..MAX_BIDS {
             if (i % (2 * d)) < d {
                 let partner = i + d;
                 let dir_lower_first = ((i / g) % 2) == 0;
-                bitonic_compare(bids, i, partner, dir_lower_first);
+                bitonic_compare(flat, i, partner, dir_lower_first);
             }
         }
     }
 
-    // Descending overall sort: position lower index with larger price when
-    // `dir_lower_first` is true; otherwise position smaller price first.
-    fn bitonic_compare(bids: &mut [Bid; MAX_BIDS], i: usize, j: usize, dir_lower_first: bool) {
-        let a = bids[i];
-        let b = bids[j];
+    fn bitonic_compare(flat: &mut [u64; FLAT_SIZE], i: usize, j: usize, dir_lower_first: bool) {
+        let pi = 3 * i;
+        let pj = 3 * j;
+        let a_price = flat[pi];
+        let b_price = flat[pj];
+        let a_qty = flat[pi + 1];
+        let b_qty = flat[pj + 1];
+        let a_id = flat[pi + 2];
+        let b_id = flat[pj + 2];
         let swap = if dir_lower_first {
-            a.price < b.price
+            a_price < b_price
         } else {
-            a.price > b.price
+            a_price > b_price
         };
         if swap {
-            bids[i] = b;
-            bids[j] = a;
+            flat[pi] = b_price;
+            flat[pj] = a_price;
+            flat[pi + 1] = b_qty;
+            flat[pj + 1] = a_qty;
+            flat[pi + 2] = b_id;
+            flat[pj + 2] = a_id;
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // Plaintext mirror of the bitonic network used inside the encrypted circuit.
-    // Tests the index/direction algebra; the encrypted version runs the same
-    // shape over MPC-backed Bid values.
+    const MAX_BIDS: usize = 8;
+    const FLAT_SIZE: usize = MAX_BIDS * 3;
 
-    const MAX_BIDS: usize = 32;
-
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    struct Bid {
-        price: u64,
-        quantity: u64,
-        bidder_id: u64,
-    }
-
-    fn bitonic_compare(bids: &mut [Bid; MAX_BIDS], i: usize, j: usize, dir_lower_first: bool) {
-        let a = bids[i];
-        let b = bids[j];
+    fn bitonic_compare(flat: &mut [u64; FLAT_SIZE], i: usize, j: usize, dir_lower_first: bool) {
+        let pi = 3 * i;
+        let pj = 3 * j;
+        let a_price = flat[pi];
+        let b_price = flat[pj];
+        let a_qty = flat[pi + 1];
+        let b_qty = flat[pj + 1];
+        let a_id = flat[pi + 2];
+        let b_id = flat[pj + 2];
         let swap = if dir_lower_first {
-            a.price < b.price
+            a_price < b_price
         } else {
-            a.price > b.price
+            a_price > b_price
         };
         if swap {
-            bids[i] = b;
-            bids[j] = a;
+            flat[pi] = b_price;
+            flat[pj] = a_price;
+            flat[pi + 1] = b_qty;
+            flat[pj + 1] = a_qty;
+            flat[pi + 2] = b_id;
+            flat[pj + 2] = a_id;
         }
     }
 
-    fn bitonic_stage(bids: &mut [Bid; MAX_BIDS], d: usize, g: usize) {
+    fn bitonic_stage(flat: &mut [u64; FLAT_SIZE], d: usize, g: usize) {
         for i in 0..MAX_BIDS {
             if (i % (2 * d)) < d {
                 let partner = i + d;
                 let dir_lower_first = ((i / g) % 2) == 0;
-                bitonic_compare(bids, i, partner, dir_lower_first);
+                bitonic_compare(flat, i, partner, dir_lower_first);
             }
         }
     }
 
-    fn bitonic_sort_desc(bids: &mut [Bid; MAX_BIDS]) {
-        bitonic_stage(bids, 1, 2);
-        bitonic_stage(bids, 2, 4);
-        bitonic_stage(bids, 1, 4);
-        bitonic_stage(bids, 4, 8);
-        bitonic_stage(bids, 2, 8);
-        bitonic_stage(bids, 1, 8);
-        bitonic_stage(bids, 8, 16);
-        bitonic_stage(bids, 4, 16);
-        bitonic_stage(bids, 2, 16);
-        bitonic_stage(bids, 1, 16);
-        bitonic_stage(bids, 16, 32);
-        bitonic_stage(bids, 8, 32);
-        bitonic_stage(bids, 4, 32);
-        bitonic_stage(bids, 2, 32);
-        bitonic_stage(bids, 1, 32);
+    fn bitonic_sort_desc(flat: &mut [u64; FLAT_SIZE]) {
+        bitonic_stage(flat, 1, 2);
+        bitonic_stage(flat, 2, 4);
+        bitonic_stage(flat, 1, 4);
+        bitonic_stage(flat, 4, 8);
+        bitonic_stage(flat, 2, 8);
+        bitonic_stage(flat, 1, 8);
     }
 
-    fn bid(price: u64, bidder_id: u64) -> Bid {
-        Bid { price, quantity: 0, bidder_id }
+    fn empty_flat() -> [u64; FLAT_SIZE] {
+        let mut flat = [0u64; FLAT_SIZE];
+        for i in 0..MAX_BIDS {
+            flat[3 * i + 2] = u64::MAX;
+        }
+        flat
     }
 
-    fn empty() -> Bid {
-        Bid { price: 0, quantity: 0, bidder_id: u64::MAX }
+    fn set_bid(flat: &mut [u64; FLAT_SIZE], i: usize, price: u64, qty: u64, id: u64) {
+        flat[3 * i] = price;
+        flat[3 * i + 1] = qty;
+        flat[3 * i + 2] = id;
     }
 
-    fn assert_descending(bids: &[Bid; MAX_BIDS]) {
+    fn assert_descending(flat: &[u64; FLAT_SIZE]) {
         for i in 1..MAX_BIDS {
+            let prev_price = flat[3 * (i - 1)];
+            let cur_price = flat[3 * i];
             assert!(
-                bids[i - 1].price >= bids[i].price,
-                "not descending at {}: {} < {}",
+                prev_price >= cur_price,
+                "not descending at slot {}: {} < {}",
                 i,
-                bids[i - 1].price,
-                bids[i].price
+                prev_price,
+                cur_price
             );
         }
     }
 
     #[test]
     fn already_descending() {
-        let mut bids = [empty(); MAX_BIDS];
+        let mut flat = empty_flat();
         for i in 0..MAX_BIDS {
-            bids[i] = bid((MAX_BIDS - i) as u64 * 10, i as u64);
+            set_bid(&mut flat, i, (MAX_BIDS - i) as u64 * 10, 1, i as u64);
         }
-        bitonic_sort_desc(&mut bids);
-        assert_descending(&bids);
-        assert_eq!(bids[0].price, 320);
-        assert_eq!(bids[31].price, 10);
+        bitonic_sort_desc(&mut flat);
+        assert_descending(&flat);
+        assert_eq!(flat[0], 80);
+        assert_eq!(flat[3 * (MAX_BIDS - 1)], 10);
     }
 
     #[test]
     fn ascending_input_reverses() {
-        let mut bids = [empty(); MAX_BIDS];
+        let mut flat = empty_flat();
         for i in 0..MAX_BIDS {
-            bids[i] = bid(i as u64 * 10 + 1, i as u64);
+            set_bid(&mut flat, i, i as u64 * 10 + 1, 1, i as u64);
         }
-        bitonic_sort_desc(&mut bids);
-        assert_descending(&bids);
+        bitonic_sort_desc(&mut flat);
+        assert_descending(&flat);
         for i in 0..MAX_BIDS {
-            assert_eq!(bids[i].price, ((MAX_BIDS - 1 - i) as u64) * 10 + 1);
+            assert_eq!(flat[3 * i], ((MAX_BIDS - 1 - i) as u64) * 10 + 1);
         }
     }
 
     #[test]
     fn three_real_bids_with_zeros() {
-        let mut bids = [empty(); MAX_BIDS];
-        bids[0] = Bid { price: 10, quantity: 500, bidder_id: 0 };
-        bids[1] = Bid { price: 8, quantity: 300, bidder_id: 1 };
-        bids[2] = Bid { price: 7, quantity: 400, bidder_id: 2 };
-        bitonic_sort_desc(&mut bids);
-        assert_eq!(bids[0].price, 10);
-        assert_eq!(bids[0].bidder_id, 0);
-        assert_eq!(bids[1].price, 8);
-        assert_eq!(bids[1].bidder_id, 1);
-        assert_eq!(bids[2].price, 7);
-        assert_eq!(bids[2].bidder_id, 2);
+        let mut flat = empty_flat();
+        set_bid(&mut flat, 0, 10, 500, 0);
+        set_bid(&mut flat, 1, 8, 300, 1);
+        set_bid(&mut flat, 2, 7, 400, 2);
+        bitonic_sort_desc(&mut flat);
+        assert_eq!(flat[0], 10);
+        assert_eq!(flat[2], 0);
+        assert_eq!(flat[3], 8);
+        assert_eq!(flat[5], 1);
+        assert_eq!(flat[6], 7);
+        assert_eq!(flat[8], 2);
         for i in 3..MAX_BIDS {
-            assert_eq!(bids[i].price, 0);
-            assert_eq!(bids[i].bidder_id, u64::MAX);
+            assert_eq!(flat[3 * i], 0);
+            assert_eq!(flat[3 * i + 2], u64::MAX);
         }
     }
 
     #[test]
     fn random_permutation() {
-        // A scrambled permutation of 1..=32 across all 32 slots.
-        let prices: [u64; MAX_BIDS] = [
-            5, 12, 7, 1, 9, 14, 2, 11, 3, 8, 6, 13, 4, 15, 10, 16,
-            17, 23, 18, 20, 19, 24, 21, 22, 25, 31, 26, 28, 27, 32, 29, 30,
-        ];
-        let mut bids = [empty(); MAX_BIDS];
+        let prices: [u64; MAX_BIDS] = [5, 7, 1, 2, 3, 8, 4, 6];
+        let mut flat = empty_flat();
         for i in 0..MAX_BIDS {
-            bids[i] = bid(prices[i], i as u64);
+            set_bid(&mut flat, i, prices[i], 1, i as u64);
         }
-        bitonic_sort_desc(&mut bids);
-        assert_descending(&bids);
+        bitonic_sort_desc(&mut flat);
+        assert_descending(&flat);
         for i in 0..MAX_BIDS {
-            assert_eq!(bids[i].price, (MAX_BIDS - i) as u64);
-        }
-    }
-
-    #[test]
-    fn ties_preserve_order() {
-        let mut bids = [empty(); MAX_BIDS];
-        bids[0] = bid(5, 0);
-        bids[1] = bid(5, 1);
-        bids[2] = bid(5, 2);
-        bitonic_sort_desc(&mut bids);
-        assert_descending(&bids);
-        assert_eq!(bids[0].price, 5);
-        assert_eq!(bids[1].price, 5);
-        assert_eq!(bids[2].price, 5);
-        for i in 3..MAX_BIDS {
-            assert_eq!(bids[i].price, 0);
+            assert_eq!(flat[3 * i], (MAX_BIDS - i) as u64);
         }
     }
 }

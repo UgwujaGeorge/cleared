@@ -1,7 +1,6 @@
 use anchor_lang::prelude::*;
 use arcium_anchor::prelude::*;
-use arcium_client::idl::arcium::types::{CallbackAccount, CircuitSource, OffChainCircuitSource};
-use arcium_macros::circuit_hash;
+use arcium_client::idl::arcium::types::CallbackAccount;
 
 const COMP_DEF_OFFSET_INIT_BID_BOOK: u32 = comp_def_offset("init_bid_book");
 const COMP_DEF_OFFSET_ADD_BID: u32 = comp_def_offset("add_bid");
@@ -10,64 +9,34 @@ const COMP_DEF_OFFSET_COMPUTE_CLEARING: u32 = comp_def_offset("compute_clearing"
 declare_id!("2b48e7A9c91zVVnZSri15CXvDtgmLHYCqACL6GQYkqn9");
 
 // Must match `MAX_BIDS` in encrypted-ixs/src/lib.rs.
-pub const MAX_BIDS: usize = 32;
-// BidBook scalars: MAX_BIDS bids × 3 fields + 1 count = 3N+1.
-pub const BID_BOOK_CT_COUNT: usize = MAX_BIDS * 3 + 1;
-
-// Byte offset of encrypted_bid_book within the Auction account.
-// Anchor disc (8) + auction_id (8) + issuer (32) + total_supply..closes_at (8*5)
-//   + status (1) + bid_count (2) + clearing_price (8) + total_sold (8) + allocations (8*MAX_BIDS).
-pub const ENCRYPTED_BID_BOOK_OFFSET: u32 = 107 + 8 * MAX_BIDS as u32;
-pub const ENCRYPTED_BID_BOOK_LENGTH: u32 = 32 * BID_BOOK_CT_COUNT as u32;
-
-// Off-chain circuit storage: GitHub Release assets on UgwujaGeorge/cleared.
-// Bump the tag here when promoting a build (v0.1.0-rc1 → v0.1.0).
-const INIT_BID_BOOK_URL: &str =
-    "https://github.com/UgwujaGeorge/cleared/releases/download/v0.1.0-rc1/init_bid_book.arcis";
-const ADD_BID_URL: &str =
-    "https://github.com/UgwujaGeorge/cleared/releases/download/v0.1.0-rc1/add_bid.arcis";
-const COMPUTE_CLEARING_URL: &str =
-    "https://github.com/UgwujaGeorge/cleared/releases/download/v0.1.0-rc1/compute_clearing.arcis";
+pub const MAX_BIDS: usize = 8;
+// BidBook ciphertext count after Pack<[u64; 3*MAX_BIDS]>: 3 u64s per BLS12-381
+// scalar field gives ceil(3*MAX_BIDS / 3) = MAX_BIDS field elements. Count is
+// tracked plaintext as auction.bid_count and passed back to the circuit per call.
+pub const BID_BOOK_CT_COUNT: usize = MAX_BIDS;
 
 #[arcium_program]
 pub mod cleared {
     use super::*;
 
     // === comp def init (called once per circuit after program deploy) ===
+    // Circuit source = None: bytes are uploaded on-chain via @arcium-hq/client
+    // `uploadCircuit` and stored on the comp_def account. For devnet shipping
+    // we'll add a separate OffChain path (GitHub Releases) once a stable build
+    // is tagged.
 
     pub fn init_init_bid_book_comp_def(ctx: Context<InitInitBidBookCompDef>) -> Result<()> {
-        init_comp_def(
-            ctx.accounts,
-            Some(CircuitSource::OffChain(OffChainCircuitSource {
-                source: INIT_BID_BOOK_URL.to_string(),
-                hash: circuit_hash!("init_bid_book"),
-            })),
-            None,
-        )?;
+        init_comp_def(ctx.accounts, None, None)?;
         Ok(())
     }
 
     pub fn init_add_bid_comp_def(ctx: Context<InitAddBidCompDef>) -> Result<()> {
-        init_comp_def(
-            ctx.accounts,
-            Some(CircuitSource::OffChain(OffChainCircuitSource {
-                source: ADD_BID_URL.to_string(),
-                hash: circuit_hash!("add_bid"),
-            })),
-            None,
-        )?;
+        init_comp_def(ctx.accounts, None, None)?;
         Ok(())
     }
 
     pub fn init_compute_clearing_comp_def(ctx: Context<InitComputeClearingCompDef>) -> Result<()> {
-        init_comp_def(
-            ctx.accounts,
-            Some(CircuitSource::OffChain(OffChainCircuitSource {
-                source: COMPUTE_CLEARING_URL.to_string(),
-                hash: circuit_hash!("compute_clearing"),
-            })),
-            None,
-        )?;
+        init_comp_def(ctx.accounts, None, None)?;
         Ok(())
     }
 
@@ -156,8 +125,7 @@ pub mod cleared {
         bidder_nonce: u128,
     ) -> Result<()> {
         // Snapshot + validate (scoped so the mutable borrow releases before queue_computation).
-        // Note: bid_book ciphertext is NOT snapshotted — passed by account-ref below.
-        let (auction_id, bidder_id, auction_key, bid_book_nonce) = {
+        let (auction_id, bidder_id, auction_key, bid_book_nonce, bid_book) = {
             let auction = &ctx.accounts.auction;
             require!(
                 auction.status == AuctionStatus::Active,
@@ -181,6 +149,7 @@ pub mod cleared {
                 auction.bid_count as u64,
                 auction.key(),
                 auction.encrypted_bid_book_nonce,
+                auction.encrypted_bid_book,
             )
         };
 
@@ -196,18 +165,20 @@ pub mod cleared {
         ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
 
         // Param order must match add_bid signature:
-        //   (Enc<Shared, UserBid>, u64 bidder_id, Enc<Mxe, BidBook>)
-        // BidBook ciphertext is referenced via .account() so the (3N+1)*32-byte
-        // payload stays out of the 1232-byte tx-data limit.
-        let args = ArgBuilder::new()
+        //   (Enc<Shared, UserBid>, u64 bidder_id, u64 count, Enc<Mxe, BidBook>)
+        // bidder_id == count at submission time (sequential 0,1,2...).
+        let mut args = ArgBuilder::new()
             .x25519_pubkey(bidder_pubkey)
             .plaintext_u128(bidder_nonce)
             .encrypted_u64(price_ct)
             .encrypted_u64(quantity_ct)
             .plaintext_u64(bidder_id)
-            .plaintext_u128(u128::from_le_bytes(bid_book_nonce))
-            .account(auction_key, ENCRYPTED_BID_BOOK_OFFSET, ENCRYPTED_BID_BOOK_LENGTH)
-            .build();
+            .plaintext_u64(bidder_id)
+            .plaintext_u128(u128::from_le_bytes(bid_book_nonce));
+        for ciphertext in bid_book {
+            args = args.encrypted_u64(ciphertext);
+        }
+        let args = args.build();
 
         queue_computation(
             ctx.accounts,
@@ -263,17 +234,20 @@ pub mod cleared {
 
         auction.status = AuctionStatus::Closing;
 
-        let auction_key = auction.key();
         let bid_book_nonce = auction.encrypted_bid_book_nonce;
+        let bid_book = auction.encrypted_bid_book;
         let total_supply = auction.total_supply;
+        let bid_count = auction.bid_count as u64;
 
         ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
 
-        // Param order: (Enc<Mxe, BidBook>, u64 total_supply)
-        // BidBook ciphertext referenced via .account() (same rationale as submit_bid).
-        let args = ArgBuilder::new()
-            .plaintext_u128(u128::from_le_bytes(bid_book_nonce))
-            .account(auction_key, ENCRYPTED_BID_BOOK_OFFSET, ENCRYPTED_BID_BOOK_LENGTH)
+        // Param order: (Enc<Mxe, BidBook>, u64 count, u64 total_supply)
+        let mut args = ArgBuilder::new().plaintext_u128(u128::from_le_bytes(bid_book_nonce));
+        for ciphertext in bid_book {
+            args = args.encrypted_u64(ciphertext);
+        }
+        let args = args
+            .plaintext_u64(bid_count)
             .plaintext_u64(total_supply)
             .build();
 
@@ -347,17 +321,8 @@ pub struct Auction {
 
 impl Auction {
     // 8 disc + 8 + 32 + 8*5 + 1 + 2 + 8*2 + 8*MAX_BIDS + 32*BID_BOOK_CT_COUNT + 16 + 1
-    pub const SIZE: usize = 8
-        + 8
-        + 32
-        + 8 * 5
-        + 1
-        + 2
-        + 8 * 2
-        + 8 * MAX_BIDS
-        + 32 * BID_BOOK_CT_COUNT
-        + 16
-        + 1;
+    pub const SIZE: usize =
+        8 + 8 + 32 + 8 * 5 + 1 + 2 + 8 * 2 + 8 * MAX_BIDS + 32 * BID_BOOK_CT_COUNT + 16 + 1;
 }
 
 #[account]
