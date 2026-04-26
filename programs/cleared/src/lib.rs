@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use arcium_anchor::prelude::*;
-use arcium_client::idl::arcium::types::CallbackAccount;
+use arcium_client::idl::arcium::types::{CallbackAccount, CircuitSource, OffChainCircuitSource};
+use arcium_macros::circuit_hash;
 
 const COMP_DEF_OFFSET_INIT_BID_BOOK: u32 = comp_def_offset("init_bid_book");
 const COMP_DEF_OFFSET_ADD_BID: u32 = comp_def_offset("add_bid");
@@ -15,28 +16,54 @@ pub const MAX_BIDS: usize = 8;
 // tracked plaintext as auction.bid_count and passed back to the circuit per call.
 pub const BID_BOOK_CT_COUNT: usize = MAX_BIDS;
 
+const INIT_BID_BOOK_URL: &str =
+    "https://github.com/UgwujaGeorge/cleared/releases/download/v0.1.0-rc1/init_bid_book.arcis";
+const ADD_BID_URL: &str =
+    "https://github.com/UgwujaGeorge/cleared/releases/download/v0.1.0-rc1/add_bid.arcis";
+const COMPUTE_CLEARING_URL: &str =
+    "https://github.com/UgwujaGeorge/cleared/releases/download/v0.1.0-rc1/compute_clearing.arcis";
+
 #[arcium_program]
 pub mod cleared {
     use super::*;
 
     // === comp def init (called once per circuit after program deploy) ===
-    // Circuit source = None: bytes are uploaded on-chain via @arcium-hq/client
-    // `uploadCircuit` and stored on the comp_def account. For devnet shipping
-    // we'll add a separate OffChain path (GitHub Releases) once a stable build
-    // is tagged.
+    // Circuit bytes are hosted off-chain in the GitHub release above; Arcium
+    // verifies the downloaded bytes against the compile-time circuit_hash.
 
     pub fn init_init_bid_book_comp_def(ctx: Context<InitInitBidBookCompDef>) -> Result<()> {
-        init_comp_def(ctx.accounts, None, None)?;
+        init_comp_def(
+            ctx.accounts,
+            Some(CircuitSource::OffChain(OffChainCircuitSource {
+                source: INIT_BID_BOOK_URL.to_string(),
+                hash: circuit_hash!("init_bid_book"),
+            })),
+            None,
+        )?;
         Ok(())
     }
 
     pub fn init_add_bid_comp_def(ctx: Context<InitAddBidCompDef>) -> Result<()> {
-        init_comp_def(ctx.accounts, None, None)?;
+        init_comp_def(
+            ctx.accounts,
+            Some(CircuitSource::OffChain(OffChainCircuitSource {
+                source: ADD_BID_URL.to_string(),
+                hash: circuit_hash!("add_bid"),
+            })),
+            None,
+        )?;
         Ok(())
     }
 
     pub fn init_compute_clearing_comp_def(ctx: Context<InitComputeClearingCompDef>) -> Result<()> {
-        init_comp_def(ctx.accounts, None, None)?;
+        init_comp_def(
+            ctx.accounts,
+            Some(CircuitSource::OffChain(OffChainCircuitSource {
+                source: COMPUTE_CLEARING_URL.to_string(),
+                hash: circuit_hash!("compute_clearing"),
+            })),
+            None,
+        )?;
         Ok(())
     }
 

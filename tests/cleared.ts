@@ -12,7 +12,6 @@ import {
   getArciumProgram,
   getFeePoolAccAddress,
   getClockAccAddress,
-  uploadCircuit,
   RescueCipher,
   deserializeLE,
   getMXEPublicKey,
@@ -43,7 +42,7 @@ describe("Cleared", () => {
   it("runs a uniform-price clearing end-to-end", async () => {
     const owner = readKpJson(`${os.homedir()}/.config/solana/id.json`);
 
-    // 1. Init all three comp defs + upload circuits (idempotent across test runs).
+    // 1. Init all three comp defs (idempotent across test runs).
     for (const name of CIRCUIT_NAMES) {
       console.log(`Initializing comp def: ${name}`);
       await initCompDef(program, owner, name);
@@ -341,20 +340,7 @@ describe("Cleared", () => {
       .signers([owner])
       .rpc({ commitment: "confirmed" });
 
-    const rawCircuit = fs.readFileSync(`build/${circuit}.arcis`);
-    await uploadCircuit(
-      provider,
-      circuit,
-      program.programId,
-      rawCircuit,
-      true,
-      500,
-      {
-        skipPreflight: true,
-        preflightCommitment: "confirmed",
-        commitment: "confirmed",
-      }
-    );
+    console.log(`  using off-chain circuit source for ${circuit}`);
   }
 });
 
