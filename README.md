@@ -4,7 +4,21 @@
 
 Cleared lets Solana projects launch their tokens via encrypted uniform-price sealed-bid auctions — the same mechanism the U.S. Treasury uses for bond auctions — so issuers get the true market price and bidders can't be sniped or front-run.
 
-> **Status:** Phase 0 scaffold. Not yet functional. See build phases in `CLEARED_INSTRUCTIONS.md`.
+> **Status:** Phase 2 devnet proof complete. The Anchor program and Arcium
+> circuits run end-to-end on devnet at `MAX_BIDS=8`.
+
+## Devnet Deployment
+
+- **Program ID:** `2b48e7A9c91zVVnZSri15CXvDtgmLHYCqACL6GQYkqn9`
+- **Circuit release:** [`v0.1.0`](https://github.com/UgwujaGeorge/cleared/releases/tag/v0.1.0)
+- **Canonical settlement tx:** [`5A2dKvXRSy3ecqzQLEBWzoh4uy5MU8aF4Rto1E4hVCSVCjooCDsdfPUdBHDDkdfmTYASMgUpT29TkP9E8n7xK9Pr`](https://solscan.io/tx/5A2dKvXRSy3ecqzQLEBWzoh4uy5MU8aF4Rto1E4hVCSVCjooCDsdfPUdBHDDkdfmTYASMgUpT29TkP9E8n7xK9Pr?cluster=devnet)
+
+Verified devnet scenario:
+
+- Alice bids `500 @ 10`
+- Bob bids `300 @ 8`
+- Carol bids `400 @ 7`
+- Result: clearing price `7`, total sold `1000`, allocations `[500, 300, 200, 0, 0, 0, 0, 0]`
 
 ## What this is
 
