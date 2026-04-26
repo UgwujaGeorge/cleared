@@ -8,6 +8,9 @@ skip-lint = false
 [programs.localnet]
 cleared = "2b48e7A9c91zVVnZSri15CXvDtgmLHYCqACL6GQYkqn9"
 
+[programs.devnet]
+cleared = "2b48e7A9c91zVVnZSri15CXvDtgmLHYCqACL6GQYkqn9"
+
 [registry]
 url = "https://api.apr.dev"
 

@@ -17,11 +17,11 @@ pub const MAX_BIDS: usize = 8;
 pub const BID_BOOK_CT_COUNT: usize = MAX_BIDS;
 
 const INIT_BID_BOOK_URL: &str =
-    "https://github.com/UgwujaGeorge/cleared/releases/download/v0.1.0-rc1/init_bid_book.arcis";
+    "https://github.com/UgwujaGeorge/cleared/releases/download/v0.1.0/init_bid_book.arcis";
 const ADD_BID_URL: &str =
-    "https://github.com/UgwujaGeorge/cleared/releases/download/v0.1.0-rc1/add_bid.arcis";
+    "https://github.com/UgwujaGeorge/cleared/releases/download/v0.1.0/add_bid.arcis";
 const COMPUTE_CLEARING_URL: &str =
-    "https://github.com/UgwujaGeorge/cleared/releases/download/v0.1.0-rc1/compute_clearing.arcis";
+    "https://github.com/UgwujaGeorge/cleared/releases/download/v0.1.0/compute_clearing.arcis";
 
 #[arcium_program]
 pub mod cleared {
