@@ -1,7 +1,14 @@
 use anchor_lang::prelude::*;
+use anchor_lang::system_program;
+use anchor_spl::associated_token::AssociatedToken;
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 use arcium_anchor::prelude::*;
 use arcium_client::idl::arcium::types::{CallbackAccount, CircuitSource, OffChainCircuitSource};
 use arcium_macros::circuit_hash;
+
+// PDA seed constants for escrow / authority accounts.
+pub const ESCROW_AUTHORITY_SEED: &[u8] = b"auction_authority";
+pub const SOL_ESCROW_SEED: &[u8] = b"sol_escrow";
 
 const COMP_DEF_OFFSET_INIT_BID_BOOK: u32 = comp_def_offset("init_bid_book");
 const COMP_DEF_OFFSET_ADD_BID: u32 = comp_def_offset("add_bid");
@@ -82,6 +89,19 @@ pub mod cleared {
         require!(total_supply > 0, ErrorCode::InvalidSupply);
         require!(closes_at > opens_at, ErrorCode::InvalidSchedule);
 
+        // Move the SPL supply from issuer into the escrow ATA before recording state.
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.issuer_token_account.to_account_info(),
+                    to: ctx.accounts.token_escrow.to_account_info(),
+                    authority: ctx.accounts.issuer.to_account_info(),
+                },
+            ),
+            total_supply,
+        )?;
+
         let auction = &mut ctx.accounts.auction;
         auction.auction_id = auction_id;
         auction.issuer = ctx.accounts.issuer.key();
@@ -98,6 +118,12 @@ pub mod cleared {
         auction.encrypted_bid_book = [[0u8; 32]; BID_BOOK_CT_COUNT];
         auction.encrypted_bid_book_nonce = [0u8; 16];
         auction.bump = ctx.bumps.auction;
+        auction.token_mint = ctx.accounts.token_mint.key();
+        auction.token_escrow = ctx.accounts.token_escrow.key();
+        auction.sol_escrow = ctx.accounts.sol_escrow.key();
+        auction.escrow_authority_bump = ctx.bumps.escrow_authority;
+        auction.sol_escrow_bump = ctx.bumps.sol_escrow;
+        auction.issuer_claimed = false;
 
         ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
 
@@ -150,6 +176,7 @@ pub mod cleared {
         quantity_ct: [u8; 32],
         bidder_pubkey: [u8; 32],
         bidder_nonce: u128,
+        max_spend: u64,
     ) -> Result<()> {
         // Snapshot + validate (scoped so the mutable borrow releases before queue_computation).
         let (auction_id, bidder_id, auction_key, bid_book_nonce, bid_book) = {
@@ -171,6 +198,7 @@ pub mod cleared {
                 (auction.bid_count as usize) < MAX_BIDS,
                 ErrorCode::AuctionFull
             );
+            require!(max_spend > 0, ErrorCode::ZeroDeposit);
             (
                 auction.auction_id,
                 auction.bid_count as u64,
@@ -180,6 +208,20 @@ pub mod cleared {
             )
         };
 
+        // Move max_spend lamports from bidder into the per-auction sol escrow PDA.
+        // Bidder is system-owned so a CPI transfer is the right primitive here;
+        // outbound from sol_escrow uses direct lamport mutation in claim_*.
+        system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                system_program::Transfer {
+                    from: ctx.accounts.bidder.to_account_info(),
+                    to: ctx.accounts.sol_escrow.to_account_info(),
+                },
+            ),
+            max_spend,
+        )?;
+
         {
             let bid_record = &mut ctx.accounts.bid_record;
             bid_record.auction_id = auction_id;
@@ -187,6 +229,13 @@ pub mod cleared {
             bid_record.bidder_id = bidder_id;
             bid_record.status = BidStatus::Pending;
             bid_record.bump = ctx.bumps.bid_record;
+            bid_record.sol_deposited = max_spend;
+            bid_record.won_quantity = 0;
+            bid_record.refund_amount = 0;
+            bid_record.encrypted_price = price_ct;
+            bid_record.encrypted_quantity = quantity_ct;
+            bid_record.bidder_pubkey = bidder_pubkey;
+            bid_record.bidder_nonce = bidder_nonce;
         }
 
         ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
@@ -323,6 +372,195 @@ pub mod cleared {
         });
         Ok(())
     }
+
+    // === claim_winner: bidder pulls their SPL allocation + SOL refund ===
+
+    pub fn claim_winner(ctx: Context<ClaimWinner>) -> Result<()> {
+        let auction = &ctx.accounts.auction;
+        let bid_record = &ctx.accounts.bid_record;
+
+        require!(
+            auction.status == AuctionStatus::Settled,
+            ErrorCode::AuctionNotSettled
+        );
+        require!(
+            bid_record.status == BidStatus::Pending,
+            ErrorCode::BidAlreadyClaimed
+        );
+
+        let bidder_id = bid_record.bidder_id as usize;
+        require!(bidder_id < MAX_BIDS, ErrorCode::InvalidBidderId);
+        let won_qty = auction.allocations[bidder_id];
+        require!(won_qty > 0, ErrorCode::NotWinner);
+
+        let owed_lamports = auction
+            .clearing_price
+            .checked_mul(won_qty)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+        require!(
+            bid_record.sol_deposited >= owed_lamports,
+            ErrorCode::InsufficientDeposit
+        );
+        let refund = bid_record
+            .sol_deposited
+            .checked_sub(owed_lamports)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+
+        // SPL: token_escrow -> bidder_token_account, signed by escrow_authority PDA.
+        let auction_id_bytes = auction.auction_id.to_le_bytes();
+        let auth_seeds: &[&[u8]] = &[
+            ESCROW_AUTHORITY_SEED,
+            auction_id_bytes.as_ref(),
+            std::slice::from_ref(&auction.escrow_authority_bump),
+        ];
+        let auth_signer: &[&[&[u8]]] = &[auth_seeds];
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.token_escrow.to_account_info(),
+                    to: ctx.accounts.bidder_token_account.to_account_info(),
+                    authority: ctx.accounts.escrow_authority.to_account_info(),
+                },
+                auth_signer,
+            ),
+            won_qty,
+        )?;
+
+        // SOL refund: direct lamport mutation (sol_escrow is owned by this program).
+        if refund > 0 {
+            transfer_from_pda(
+                &ctx.accounts.sol_escrow.to_account_info(),
+                &ctx.accounts.bidder.to_account_info(),
+                refund,
+            )?;
+        }
+
+        let bid_record = &mut ctx.accounts.bid_record;
+        bid_record.won_quantity = won_qty;
+        bid_record.refund_amount = refund;
+        bid_record.status = BidStatus::Claimed;
+        Ok(())
+    }
+
+    // === claim_loser: bidder pulls full SOL refund (no SPL allocation) ===
+
+    pub fn claim_loser(ctx: Context<ClaimLoser>) -> Result<()> {
+        let auction = &ctx.accounts.auction;
+        let bid_record = &ctx.accounts.bid_record;
+
+        require!(
+            auction.status == AuctionStatus::Settled,
+            ErrorCode::AuctionNotSettled
+        );
+        require!(
+            bid_record.status == BidStatus::Pending,
+            ErrorCode::BidAlreadyClaimed
+        );
+
+        let bidder_id = bid_record.bidder_id as usize;
+        require!(bidder_id < MAX_BIDS, ErrorCode::InvalidBidderId);
+        require!(
+            auction.allocations[bidder_id] == 0,
+            ErrorCode::NotLoser
+        );
+
+        let refund = bid_record.sol_deposited;
+        if refund > 0 {
+            transfer_from_pda(
+                &ctx.accounts.sol_escrow.to_account_info(),
+                &ctx.accounts.bidder.to_account_info(),
+                refund,
+            )?;
+        }
+
+        let bid_record = &mut ctx.accounts.bid_record;
+        bid_record.refund_amount = refund;
+        bid_record.status = BidStatus::Claimed;
+        Ok(())
+    }
+
+    // === claim_issuer: issuer pulls clearing_price * total_sold proceeds + unsold SPL ===
+
+    pub fn claim_issuer(ctx: Context<ClaimIssuer>) -> Result<()> {
+        let auction = &ctx.accounts.auction;
+
+        require!(
+            auction.status == AuctionStatus::Settled,
+            ErrorCode::AuctionNotSettled
+        );
+        require!(!auction.issuer_claimed, ErrorCode::IssuerAlreadyClaimed);
+        require!(
+            auction.issuer == ctx.accounts.issuer.key(),
+            ErrorCode::WrongIssuer
+        );
+
+        let proceeds = auction
+            .clearing_price
+            .checked_mul(auction.total_sold)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+        let unsold = auction
+            .total_supply
+            .checked_sub(auction.total_sold)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+
+        if proceeds > 0 {
+            transfer_from_pda(
+                &ctx.accounts.sol_escrow.to_account_info(),
+                &ctx.accounts.issuer.to_account_info(),
+                proceeds,
+            )?;
+        }
+
+        if unsold > 0 {
+            let auction_id_bytes = auction.auction_id.to_le_bytes();
+            let auth_seeds: &[&[u8]] = &[
+                ESCROW_AUTHORITY_SEED,
+                auction_id_bytes.as_ref(),
+                std::slice::from_ref(&auction.escrow_authority_bump),
+            ];
+            let auth_signer: &[&[&[u8]]] = &[auth_seeds];
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.token_escrow.to_account_info(),
+                        to: ctx.accounts.issuer_token_account.to_account_info(),
+                        authority: ctx.accounts.escrow_authority.to_account_info(),
+                    },
+                    auth_signer,
+                ),
+                unsold,
+            )?;
+        }
+
+        let auction = &mut ctx.accounts.auction;
+        auction.issuer_claimed = true;
+        Ok(())
+    }
+}
+
+// ========== helpers ==========
+
+// Move lamports from a program-owned PDA to any destination by direct mutation.
+// The PDA must be owned by this program; constraints on the Accounts struct
+// guarantee that for sol_escrow.
+fn transfer_from_pda<'info>(
+    from: &AccountInfo<'info>,
+    to: &AccountInfo<'info>,
+    amount: u64,
+) -> Result<()> {
+    let from_lamports = from.lamports();
+    let new_from = from_lamports
+        .checked_sub(amount)
+        .ok_or(ErrorCode::InsufficientEscrow)?;
+    let new_to = to
+        .lamports()
+        .checked_add(amount)
+        .ok_or(ErrorCode::ArithmeticOverflow)?;
+    **from.try_borrow_mut_lamports()? = new_from;
+    **to.try_borrow_mut_lamports()? = new_to;
+    Ok(())
 }
 
 // ========== accounts ==========
@@ -344,12 +582,20 @@ pub struct Auction {
     pub encrypted_bid_book: [[u8; 32]; BID_BOOK_CT_COUNT],
     pub encrypted_bid_book_nonce: [u8; 16],
     pub bump: u8,
+    // v0.1.1 custody fields
+    pub token_mint: Pubkey,
+    pub token_escrow: Pubkey,
+    pub sol_escrow: Pubkey,
+    pub escrow_authority_bump: u8,
+    pub sol_escrow_bump: u8,
+    pub issuer_claimed: bool,
 }
 
 impl Auction {
-    // 8 disc + 8 + 32 + 8*5 + 1 + 2 + 8*2 + 8*MAX_BIDS + 32*BID_BOOK_CT_COUNT + 16 + 1
-    pub const SIZE: usize =
-        8 + 8 + 32 + 8 * 5 + 1 + 2 + 8 * 2 + 8 * MAX_BIDS + 32 * BID_BOOK_CT_COUNT + 16 + 1;
+    pub const SIZE: usize = 8                              // discriminator
+        + 8 + 32 + 8 * 5 + 1 + 2 + 8 * 2                   // through total_sold
+        + 8 * MAX_BIDS + 32 * BID_BOOK_CT_COUNT + 16 + 1   // allocations + book + nonce + bump
+        + 32 + 32 + 32 + 1 + 1 + 1;                        // v0.1.1 custody fields
 }
 
 #[account]
@@ -360,10 +606,19 @@ pub struct BidRecord {
     pub bidder_id: u64,
     pub status: BidStatus,
     pub bump: u8,
+    // v0.1.1 custody fields
+    pub sol_deposited: u64,
+    pub won_quantity: u64,
+    pub refund_amount: u64,
+    pub encrypted_price: [u8; 32],
+    pub encrypted_quantity: [u8; 32],
+    pub bidder_pubkey: [u8; 32],
+    pub bidder_nonce: u128,
 }
 
 impl BidRecord {
-    pub const SIZE: usize = 8 + 8 + 32 + 8 + 1 + 1;
+    pub const SIZE: usize = 8 + 8 + 32 + 8 + 1 + 1        // through bump
+        + 8 + 8 + 8 + 32 + 32 + 32 + 16;                  // v0.1.1 custody fields
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -475,6 +730,41 @@ pub struct CreateAuction<'info> {
         bump,
     )]
     pub auction: Box<Account<'info, Auction>>,
+    pub token_mint: Box<Account<'info, Mint>>,
+    #[account(
+        mut,
+        constraint = issuer_token_account.mint == token_mint.key()
+            @ ErrorCode::WrongMint,
+        constraint = issuer_token_account.owner == issuer.key()
+            @ ErrorCode::WrongTokenOwner,
+    )]
+    pub issuer_token_account: Box<Account<'info, TokenAccount>>,
+    /// CHECK: PDA used only as the SPL escrow ATA authority. Holds no data.
+    #[account(
+        seeds = [ESCROW_AUTHORITY_SEED, auction_id.to_le_bytes().as_ref()],
+        bump,
+    )]
+    pub escrow_authority: UncheckedAccount<'info>,
+    #[account(
+        init,
+        payer = payer,
+        associated_token::mint = token_mint,
+        associated_token::authority = escrow_authority,
+    )]
+    pub token_escrow: Box<Account<'info, TokenAccount>>,
+    /// CHECK: SOL-only PDA created here, owned by this program. Lamports
+    /// are pulled out via direct mutation in claim_*.
+    #[account(
+        init,
+        payer = payer,
+        space = 0,
+        seeds = [SOL_ESCROW_SEED, auction_id.to_le_bytes().as_ref()],
+        bump,
+        owner = crate::ID,
+    )]
+    pub sol_escrow: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
     #[account(
         init_if_needed,
         space = 9,
@@ -485,7 +775,7 @@ pub struct CreateAuction<'info> {
     )]
     pub sign_pda_account: Account<'info, ArciumSignerAccount>,
     #[account(address = derive_mxe_pda!())]
-    pub mxe_account: Account<'info, MXEAccount>,
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
     #[account(
         mut,
         address = derive_mempool_pda!(mxe_account, ErrorCode::ClusterNotSet)
@@ -505,16 +795,16 @@ pub struct CreateAuction<'info> {
     /// CHECK: computation_account, checked by arcium program.
     pub computation_account: UncheckedAccount<'info>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_INIT_BID_BOOK))]
-    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
     #[account(
         mut,
         address = derive_cluster_pda!(mxe_account, ErrorCode::ClusterNotSet)
     )]
-    pub cluster_account: Account<'info, Cluster>,
+    pub cluster_account: Box<Account<'info, Cluster>>,
     #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
-    pub pool_account: Account<'info, FeePool>,
+    pub pool_account: Box<Account<'info, FeePool>>,
     #[account(mut, address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
-    pub clock_account: Account<'info, ClockAccount>,
+    pub clock_account: Box<Account<'info, ClockAccount>>,
     pub system_program: Program<'info, System>,
     pub arcium_program: Program<'info, Arcium>,
 }
@@ -526,7 +816,7 @@ pub struct InitBidBookCallback<'info> {
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_INIT_BID_BOOK))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
     #[account(address = derive_mxe_pda!())]
-    pub mxe_account: Account<'info, MXEAccount>,
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
     /// CHECK: computation_account, checked by arcium program.
     pub computation_account: UncheckedAccount<'info>,
     #[account(address = derive_cluster_pda!(mxe_account, ErrorCode::ClusterNotSet))]
@@ -566,6 +856,14 @@ pub struct SubmitBid<'info> {
         bump,
     )]
     pub bid_record: Box<Account<'info, BidRecord>>,
+    /// CHECK: per-auction SOL escrow PDA. Constraint binds it to auction.sol_escrow.
+    #[account(
+        mut,
+        address = auction.sol_escrow @ ErrorCode::WrongSolEscrow,
+        seeds = [SOL_ESCROW_SEED, auction.auction_id.to_le_bytes().as_ref()],
+        bump = auction.sol_escrow_bump,
+    )]
+    pub sol_escrow: UncheckedAccount<'info>,
     #[account(
         init_if_needed,
         space = 9,
@@ -576,7 +874,7 @@ pub struct SubmitBid<'info> {
     )]
     pub sign_pda_account: Account<'info, ArciumSignerAccount>,
     #[account(address = derive_mxe_pda!())]
-    pub mxe_account: Account<'info, MXEAccount>,
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
     #[account(
         mut,
         address = derive_mempool_pda!(mxe_account, ErrorCode::ClusterNotSet)
@@ -596,16 +894,16 @@ pub struct SubmitBid<'info> {
     /// CHECK: computation_account, checked by arcium program.
     pub computation_account: UncheckedAccount<'info>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_ADD_BID))]
-    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
     #[account(
         mut,
         address = derive_cluster_pda!(mxe_account, ErrorCode::ClusterNotSet)
     )]
-    pub cluster_account: Account<'info, Cluster>,
+    pub cluster_account: Box<Account<'info, Cluster>>,
     #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
-    pub pool_account: Account<'info, FeePool>,
+    pub pool_account: Box<Account<'info, FeePool>>,
     #[account(mut, address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
-    pub clock_account: Account<'info, ClockAccount>,
+    pub clock_account: Box<Account<'info, ClockAccount>>,
     pub system_program: Program<'info, System>,
     pub arcium_program: Program<'info, Arcium>,
 }
@@ -617,7 +915,7 @@ pub struct AddBidCallback<'info> {
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_ADD_BID))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
     #[account(address = derive_mxe_pda!())]
-    pub mxe_account: Account<'info, MXEAccount>,
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
     /// CHECK: computation_account, checked by arcium program.
     pub computation_account: UncheckedAccount<'info>,
     #[account(address = derive_cluster_pda!(mxe_account, ErrorCode::ClusterNotSet))]
@@ -653,7 +951,7 @@ pub struct CloseAuction<'info> {
     )]
     pub sign_pda_account: Account<'info, ArciumSignerAccount>,
     #[account(address = derive_mxe_pda!())]
-    pub mxe_account: Account<'info, MXEAccount>,
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
     #[account(
         mut,
         address = derive_mempool_pda!(mxe_account, ErrorCode::ClusterNotSet)
@@ -694,7 +992,7 @@ pub struct ComputeClearingCallback<'info> {
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_COMPUTE_CLEARING))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
     #[account(address = derive_mxe_pda!())]
-    pub mxe_account: Account<'info, MXEAccount>,
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
     /// CHECK: computation_account, checked by arcium program.
     pub computation_account: UncheckedAccount<'info>,
     #[account(address = derive_cluster_pda!(mxe_account, ErrorCode::ClusterNotSet))]
@@ -704,6 +1002,136 @@ pub struct ComputeClearingCallback<'info> {
     pub instructions_sysvar: AccountInfo<'info>,
     #[account(mut)]
     pub auction: Box<Account<'info, Auction>>,
+}
+
+// ========== claim instructions (v0.1.1) ==========
+
+#[derive(Accounts)]
+pub struct ClaimWinner<'info> {
+    #[account(mut)]
+    pub bidder: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"auction", auction.auction_id.to_le_bytes().as_ref()],
+        bump = auction.bump,
+    )]
+    pub auction: Box<Account<'info, Auction>>,
+    #[account(
+        mut,
+        seeds = [
+            b"bid",
+            auction.auction_id.to_le_bytes().as_ref(),
+            bidder.key().as_ref(),
+        ],
+        bump = bid_record.bump,
+        constraint = bid_record.bidder == bidder.key() @ ErrorCode::WrongBidder,
+    )]
+    pub bid_record: Box<Account<'info, BidRecord>>,
+    /// CHECK: PDA authority for the SPL escrow ATA. Address is bound by seeds + bump.
+    #[account(
+        seeds = [ESCROW_AUTHORITY_SEED, auction.auction_id.to_le_bytes().as_ref()],
+        bump = auction.escrow_authority_bump,
+    )]
+    pub escrow_authority: UncheckedAccount<'info>,
+    #[account(
+        mut,
+        address = auction.token_escrow @ ErrorCode::WrongTokenEscrow,
+    )]
+    pub token_escrow: Box<Account<'info, TokenAccount>>,
+    #[account(
+        init_if_needed,
+        payer = bidder,
+        associated_token::mint = token_mint,
+        associated_token::authority = bidder,
+    )]
+    pub bidder_token_account: Box<Account<'info, TokenAccount>>,
+    #[account(address = auction.token_mint @ ErrorCode::WrongMint)]
+    pub token_mint: Box<Account<'info, Mint>>,
+    /// CHECK: SOL escrow PDA, address pinned to auction.sol_escrow.
+    #[account(
+        mut,
+        address = auction.sol_escrow @ ErrorCode::WrongSolEscrow,
+        seeds = [SOL_ESCROW_SEED, auction.auction_id.to_le_bytes().as_ref()],
+        bump = auction.sol_escrow_bump,
+    )]
+    pub sol_escrow: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimLoser<'info> {
+    #[account(mut)]
+    pub bidder: Signer<'info>,
+    #[account(
+        seeds = [b"auction", auction.auction_id.to_le_bytes().as_ref()],
+        bump = auction.bump,
+    )]
+    pub auction: Box<Account<'info, Auction>>,
+    #[account(
+        mut,
+        seeds = [
+            b"bid",
+            auction.auction_id.to_le_bytes().as_ref(),
+            bidder.key().as_ref(),
+        ],
+        bump = bid_record.bump,
+        constraint = bid_record.bidder == bidder.key() @ ErrorCode::WrongBidder,
+    )]
+    pub bid_record: Box<Account<'info, BidRecord>>,
+    /// CHECK: SOL escrow PDA, address pinned to auction.sol_escrow.
+    #[account(
+        mut,
+        address = auction.sol_escrow @ ErrorCode::WrongSolEscrow,
+        seeds = [SOL_ESCROW_SEED, auction.auction_id.to_le_bytes().as_ref()],
+        bump = auction.sol_escrow_bump,
+    )]
+    pub sol_escrow: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimIssuer<'info> {
+    #[account(mut)]
+    pub issuer: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"auction", auction.auction_id.to_le_bytes().as_ref()],
+        bump = auction.bump,
+    )]
+    pub auction: Box<Account<'info, Auction>>,
+    /// CHECK: PDA authority for the SPL escrow ATA. Address bound by seeds + bump.
+    #[account(
+        seeds = [ESCROW_AUTHORITY_SEED, auction.auction_id.to_le_bytes().as_ref()],
+        bump = auction.escrow_authority_bump,
+    )]
+    pub escrow_authority: UncheckedAccount<'info>,
+    #[account(
+        mut,
+        address = auction.token_escrow @ ErrorCode::WrongTokenEscrow,
+    )]
+    pub token_escrow: Box<Account<'info, TokenAccount>>,
+    #[account(
+        init_if_needed,
+        payer = issuer,
+        associated_token::mint = token_mint,
+        associated_token::authority = issuer,
+    )]
+    pub issuer_token_account: Box<Account<'info, TokenAccount>>,
+    #[account(address = auction.token_mint @ ErrorCode::WrongMint)]
+    pub token_mint: Box<Account<'info, Mint>>,
+    /// CHECK: SOL escrow PDA, address pinned to auction.sol_escrow.
+    #[account(
+        mut,
+        address = auction.sol_escrow @ ErrorCode::WrongSolEscrow,
+        seeds = [SOL_ESCROW_SEED, auction.auction_id.to_le_bytes().as_ref()],
+        bump = auction.sol_escrow_bump,
+    )]
+    pub sol_escrow: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
 }
 
 // ========== events ==========
@@ -737,4 +1165,36 @@ pub enum ErrorCode {
     AuctionStillOpen,
     #[msg("Auction is full")]
     AuctionFull,
+    #[msg("Bid deposit must be > 0")]
+    ZeroDeposit,
+    #[msg("Auction is not settled yet")]
+    AuctionNotSettled,
+    #[msg("Bid has already been claimed")]
+    BidAlreadyClaimed,
+    #[msg("Issuer has already claimed proceeds")]
+    IssuerAlreadyClaimed,
+    #[msg("Caller is not the auction issuer")]
+    WrongIssuer,
+    #[msg("Caller is not the bid record owner")]
+    WrongBidder,
+    #[msg("Bid record's bidder_id is out of range")]
+    InvalidBidderId,
+    #[msg("Bid did not win an allocation")]
+    NotWinner,
+    #[msg("Bid won an allocation; use claim_winner")]
+    NotLoser,
+    #[msg("Deposited SOL is below clearing_price * won_quantity")]
+    InsufficientDeposit,
+    #[msg("SOL escrow has insufficient balance")]
+    InsufficientEscrow,
+    #[msg("Arithmetic overflow")]
+    ArithmeticOverflow,
+    #[msg("Token mint does not match auction.token_mint")]
+    WrongMint,
+    #[msg("Issuer token account is owned by the wrong wallet")]
+    WrongTokenOwner,
+    #[msg("Token escrow does not match auction.token_escrow")]
+    WrongTokenEscrow,
+    #[msg("SOL escrow does not match auction.sol_escrow")]
+    WrongSolEscrow,
 }

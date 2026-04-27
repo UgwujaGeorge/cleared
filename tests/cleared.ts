@@ -6,6 +6,15 @@ import {
   LAMPORTS_PER_SOL,
   SystemProgram,
 } from "@solana/web3.js";
+import {
+  TOKEN_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  createMint,
+  getOrCreateAssociatedTokenAccount,
+  getAssociatedTokenAddressSync,
+  mintTo,
+  getAccount as getTokenAccount,
+} from "@solana/spl-token";
 import { Cleared } from "../target/types/cleared";
 import { randomBytes } from "crypto";
 import {
@@ -36,6 +45,9 @@ import { expect } from "chai";
 const CIRCUIT_NAMES = ["init_bid_book", "add_bid", "compute_clearing"] as const;
 type CircuitName = (typeof CIRCUIT_NAMES)[number];
 
+const ESCROW_AUTHORITY_SEED = Buffer.from("auction_authority");
+const SOL_ESCROW_SEED = Buffer.from("sol_escrow");
+
 describe("Cleared", () => {
   anchor.setProvider(anchor.AnchorProvider.env());
   const program = anchor.workspace.Cleared as Program<Cleared>;
@@ -44,41 +56,79 @@ describe("Cleared", () => {
   const arciumEnv = getArciumEnv();
   const clusterAccount = getClusterAccAddress(arciumEnv.arciumClusterOffset);
 
-  it("runs a uniform-price clearing end-to-end", async () => {
+  it("runs uniform-price clearing with full SPL/SOL custody end-to-end", async () => {
     const owner = readKpJson(`${os.homedir()}/.config/solana/id.json`);
 
     // 1. Init all three comp defs (idempotent across test runs).
     for (const name of CIRCUIT_NAMES) {
       console.log(`Initializing comp def: ${name}`);
       await initCompDef(program, owner, name);
-      console.log(`  comp def ready: ${name}`);
     }
     await probeCompDefImmutability(owner, "init_bid_book");
 
-    // 2. Fetch MXE pubkey with retry (arx nodes may take time to initialize).
+    // 2. Fetch MXE pubkey.
     const mxePublicKey = await getMXEPublicKeyWithRetry(
       provider,
       program.programId
     );
-    console.log("MXE x25519 pubkey fetched");
 
-    // 3. Pick an auction id; compute Auction PDA.
+    // 3. Create a fresh SPL token mint with 0 decimals, mint total_supply to issuer.
+    const totalSupply = 1000n;
+    const mint = await createMint(
+      provider.connection,
+      owner,
+      owner.publicKey,
+      null,
+      0
+    );
+    console.log(`Test mint: ${mint.toBase58()}`);
+    const issuerAta = await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      owner,
+      mint,
+      owner.publicKey
+    );
+    await mintTo(
+      provider.connection,
+      owner,
+      mint,
+      issuerAta.address,
+      owner,
+      Number(totalSupply)
+    );
+    const issuerAtaInitial = (
+      await getTokenAccount(provider.connection, issuerAta.address)
+    ).amount;
+    expect(issuerAtaInitial.toString()).to.equal(totalSupply.toString());
+
+    // 4. Derive auction PDAs.
     const auctionId = new anchor.BN(randomBytes(8), "hex");
+    const auctionIdLe = auctionId.toArrayLike(Buffer, "le", 8);
     const [auctionPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("auction"), auctionId.toArrayLike(Buffer, "le", 8)],
+      [Buffer.from("auction"), auctionIdLe],
       program.programId
     );
+    const [escrowAuthority] = PublicKey.findProgramAddressSync(
+      [ESCROW_AUTHORITY_SEED, auctionIdLe],
+      program.programId
+    );
+    const [solEscrow] = PublicKey.findProgramAddressSync(
+      [SOL_ESCROW_SEED, auctionIdLe],
+      program.programId
+    );
+    const tokenEscrow = getAssociatedTokenAddressSync(
+      mint,
+      escrowAuthority,
+      true
+    );
 
-    // 4. create_auction -> init_bid_book.
-    // Localnet clock is independent of wall clock — fetch it from the validator.
+    // 5. create_auction -> init_bid_book.
     const slot = await provider.connection.getSlot("confirmed");
     const solanaNow = await provider.connection.getBlockTime(slot);
     if (solanaNow === null) throw new Error("Failed to read validator clock");
-    const now = solanaNow;
-    const opensAt = new anchor.BN(now - 5); // already open
-    // Each MPC round-trip takes ~20-30s on localnet (init + 3 bids).
-    const closesAt = new anchor.BN(now + 90);
-    const totalSupply = new anchor.BN(1000);
+    const opensAt = new anchor.BN(solanaNow - 5);
+    // Each MPC round-trip ~20-30s on localnet (init + 4 bids = ~150s budget) — give 100s headroom.
+    const closesAt = new anchor.BN(solanaNow + 250);
 
     console.log("Creating auction...");
     const createOffset = new anchor.BN(randomBytes(8), "hex");
@@ -86,9 +136,9 @@ describe("Cleared", () => {
       .createAuction(
         createOffset,
         auctionId,
-        totalSupply,
-        new anchor.BN(0), // min_price
-        new anchor.BN(0), // max_bid_per_wallet (0 = no cap)
+        new anchor.BN(totalSupply.toString()),
+        new anchor.BN(0),
+        new anchor.BN(0),
         opensAt,
         closesAt
       )
@@ -96,98 +146,79 @@ describe("Cleared", () => {
         payer: owner.publicKey,
         issuer: owner.publicKey,
         auction: auctionPda,
-        ...arciumQueueAccounts(
-          program.programId,
-          createOffset,
-          "init_bid_book"
-        ),
+        tokenMint: mint,
+        issuerTokenAccount: issuerAta.address,
+        escrowAuthority,
+        tokenEscrow,
+        solEscrow,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        ...arciumQueueAccounts(program.programId, createOffset, "init_bid_book"),
       })
       .signers([owner])
       .rpc({ skipPreflight: false, commitment: "confirmed" });
 
-    console.log("Awaiting init_bid_book finalization...");
-    const finalizeRet = await awaitComputationFinalization(
+    await awaitComputationFinalization(
       provider,
       createOffset,
       program.programId,
       "confirmed"
     );
-    console.log(
-      `  finalize ret = ${JSON.stringify(finalizeRet) ?? "undefined"}`
-    );
 
-    const a0 = await program.account.auction.fetch(auctionPda);
-    const nonceHex = Buffer.from(a0.encryptedBidBookNonce).toString("hex");
-    const bookAllZero = a0.encryptedBidBook.every((ct) =>
-      ct.every((b: number) => b === 0)
-    );
-    console.log(`  status         = ${JSON.stringify(a0.status)}`);
-    console.log(`  bid_count      = ${a0.bidCount}`);
-    console.log(`  bid_book_nonce = ${nonceHex}`);
-    console.log(
-      `  bid_book[0..8] = ${Buffer.from(a0.encryptedBidBook[0])
-        .slice(0, 8)
-        .toString("hex")}`
-    );
-    console.log(`  bid_book all-zero? ${bookAllZero}`);
+    // Sanity: SPL moved into escrow ATA, issuer ATA drained.
+    const escrowAfterCreate = (
+      await getTokenAccount(provider.connection, tokenEscrow)
+    ).amount;
+    const issuerAtaAfterCreate = (
+      await getTokenAccount(provider.connection, issuerAta.address)
+    ).amount;
+    expect(escrowAfterCreate.toString()).to.equal(totalSupply.toString());
+    expect(issuerAtaAfterCreate.toString()).to.equal("0");
 
-    console.log(`  fetching finalize tx ${finalizeRet}`);
-    const finalizeTx = await provider.connection.getTransaction(
-      finalizeRet as string,
-      {
-        commitment: "confirmed",
-        maxSupportedTransactionVersion: 0,
-      }
-    );
-    console.log(`    err = ${JSON.stringify(finalizeTx?.meta?.err ?? null)}`);
-    if (finalizeTx?.meta?.logMessages) {
-      for (const line of finalizeTx.meta.logMessages)
-        console.log(`      ${line}`);
-    }
-
-    // 5. Submit 3 bids with distinct bidders.
-    // Scenario (per CLEARED_INSTRUCTIONS.md example):
-    //   Alice: 500 @ 10  -> wins 500 @ 7
-    //   Bob:   300 @ 8   -> wins 300 @ 7
-    //   Carol: 400 @ 7   -> wins 200 @ 7 (partial; only 200 left)
-    //   Expected clearing_price = 7, total_sold = 1000
+    // 6. Submit 4 bids — 3 winners, 1 loser.
     const bidders = [
-      { name: "Alice", price: 10n, quantity: 500n },
-      { name: "Bob", price: 8n, quantity: 300n },
-      { name: "Carol", price: 7n, quantity: 400n },
-    ];
+      { name: "Alice", price: 10n, quantity: 500n }, // wins 500 @ 7
+      { name: "Bob", price: 8n, quantity: 300n }, // wins 300 @ 7
+      { name: "Carol", price: 7n, quantity: 400n }, // wins 200 @ 7 (partial)
+      { name: "Dave", price: 5n, quantity: 200n }, // loses
+    ] as const;
+
+    type BidContext = {
+      name: string;
+      price: bigint;
+      quantity: bigint;
+      maxSpend: bigint;
+      kp: Keypair;
+      bidRecordPda: PublicKey;
+    };
+    const ctxs: BidContext[] = [];
 
     for (let i = 0; i < bidders.length; i++) {
       const b = bidders[i];
       const kp = Keypair.generate();
-      // Fund bidder so they can pay account creation rent.
-      const fundTx = await provider.connection.requestAirdrop(
+      const maxSpend = b.price * b.quantity;
+      // Fund bidder for ATA rent + tx fees + max_spend.
+      const fund = await provider.connection.requestAirdrop(
         kp.publicKey,
         LAMPORTS_PER_SOL
       );
-      await provider.connection.confirmTransaction(fundTx, "confirmed");
+      await provider.connection.confirmTransaction(fund, "confirmed");
 
-      // Encrypt bid with per-bidder shared secret.
       const bidderPriv = x25519.utils.randomSecretKey();
       const bidderPub = x25519.getPublicKey(bidderPriv);
       const sharedSecret = x25519.getSharedSecret(bidderPriv, mxePublicKey);
       const cipher = new RescueCipher(sharedSecret);
-
       const nonce = randomBytes(16);
       const ct = cipher.encrypt([b.price, b.quantity], nonce);
 
       const [bidRecordPda] = PublicKey.findProgramAddressSync(
-        [
-          Buffer.from("bid"),
-          auctionId.toArrayLike(Buffer, "le", 8),
-          kp.publicKey.toBuffer(),
-        ],
+        [Buffer.from("bid"), auctionIdLe, kp.publicKey.toBuffer()],
         program.programId
       );
 
       const submitOffset = new anchor.BN(randomBytes(8), "hex");
       console.log(
-        `Submitting bid ${i} (${b.name}: ${b.quantity} @ ${b.price})...`
+        `Submitting bid ${i} (${b.name}: ${b.quantity} @ ${b.price}, max_spend=${maxSpend})...`
       );
       await program.methods
         .submitBid(
@@ -195,30 +226,46 @@ describe("Cleared", () => {
           Array.from(ct[0]),
           Array.from(ct[1]),
           Array.from(bidderPub),
-          new anchor.BN(deserializeLE(nonce).toString())
+          new anchor.BN(deserializeLE(nonce).toString()),
+          new anchor.BN(maxSpend.toString())
         )
         .accountsPartial({
           payer: owner.publicKey,
           bidder: kp.publicKey,
           auction: auctionPda,
           bidRecord: bidRecordPda,
+          solEscrow,
           ...arciumQueueAccounts(program.programId, submitOffset, "add_bid"),
         })
         .signers([owner, kp])
         .rpc({ skipPreflight: false, commitment: "confirmed" });
 
-      console.log(`  Awaiting add_bid finalization for ${b.name}...`);
       await awaitComputationFinalization(
         provider,
         submitOffset,
         program.programId,
         "confirmed"
       );
-      console.log(`  Bid ${i} accepted`);
+      ctxs.push({
+        name: b.name,
+        price: b.price,
+        quantity: b.quantity,
+        maxSpend,
+        kp,
+        bidRecordPda,
+      });
     }
 
-    // 6. Wait for closes_at — poll the validator clock (not wall clock).
-    console.log(`Waiting for validator clock to pass closes_at=${closesAt}...`);
+    // Sanity: sol_escrow holds Σ max_spend + the rent-exempt minimum.
+    const totalDeposited = bidders.reduce(
+      (acc, b) => acc + b.price * b.quantity,
+      0n
+    );
+    const solEscrowAfterBids =
+      await provider.connection.getBalance(solEscrow);
+    expect(solEscrowAfterBids).to.be.greaterThanOrEqual(Number(totalDeposited));
+
+    // 7. Wait past closes_at.
     while (true) {
       const s = await provider.connection.getSlot("confirmed");
       const t = await provider.connection.getBlockTime(s);
@@ -226,7 +273,7 @@ describe("Cleared", () => {
       await new Promise((r) => setTimeout(r, 2000));
     }
 
-    // 7. close_auction -> compute_clearing.
+    // 8. close_auction -> compute_clearing.
     const closeOffset = new anchor.BN(randomBytes(8), "hex");
     console.log("Closing auction...");
     await program.methods
@@ -234,42 +281,161 @@ describe("Cleared", () => {
       .accountsPartial({
         payer: owner.publicKey,
         auction: auctionPda,
-        ...arciumQueueAccounts(
-          program.programId,
-          closeOffset,
-          "compute_clearing"
-        ),
+        ...arciumQueueAccounts(program.programId, closeOffset, "compute_clearing"),
       })
       .signers([owner])
       .rpc({ skipPreflight: false, commitment: "confirmed" });
-
-    console.log("Awaiting compute_clearing finalization...");
+    // compute_clearing is the heaviest circuit; first run may include download.
     await awaitComputationFinalization(
       provider,
       closeOffset,
       program.programId,
-      "confirmed"
+      "confirmed",
+      300_000
     );
 
-    // 8. Verify clearing result.
+    // 9. Verify clearing math is unchanged by the upgrade.
     const auction = await program.account.auction.fetch(auctionPda);
-    console.log("Auction settled:");
-    console.log(`  status         = ${JSON.stringify(auction.status)}`);
-    console.log(`  bid_count      = ${auction.bidCount}`);
-    console.log(`  clearing_price = ${auction.clearingPrice.toString()}`);
     console.log(
-      `  allocations    = [${auction.allocations
-        .map((a) => a.toString())
-        .join(", ")}]`
+      `Settled: clearing_price=${auction.clearingPrice} total_sold=${auction.totalSold}`
     );
-    console.log(`  total_sold     = ${auction.totalSold.toString()}`);
-
     expect(auction.clearingPrice.toNumber()).to.equal(7);
     expect(auction.totalSold.toNumber()).to.equal(1000);
     expect(auction.allocations[0].toNumber()).to.equal(500); // Alice
     expect(auction.allocations[1].toNumber()).to.equal(300); // Bob
-    expect(auction.allocations[2].toNumber()).to.equal(200); // Carol (partial)
-    expect(auction.allocations[3].toNumber()).to.equal(0); // slot unused
+    expect(auction.allocations[2].toNumber()).to.equal(200); // Carol partial
+    expect(auction.allocations[3].toNumber()).to.equal(0); // Dave
+    for (let i = 4; i < 8; i++) {
+      expect(auction.allocations[i].toNumber()).to.equal(0);
+    }
+
+    // 10. Run claims and assert balance changes.
+    const clearingPrice = 7n;
+    const expectedRefund: Record<string, bigint> = {
+      Alice: ctxs[0].maxSpend - clearingPrice * 500n, // 5000 - 3500 = 1500
+      Bob: ctxs[1].maxSpend - clearingPrice * 300n, // 2400 - 2100 = 300
+      Carol: ctxs[2].maxSpend - clearingPrice * 200n, // 2800 - 1400 = 1400
+      Dave: ctxs[3].maxSpend, // 1000 (full)
+    };
+    const expectedWonQty: Record<string, bigint> = {
+      Alice: 500n,
+      Bob: 300n,
+      Carol: 200n,
+      Dave: 0n,
+    };
+
+    const solEscrowBeforeClaims = BigInt(
+      await provider.connection.getBalance(solEscrow)
+    );
+
+    // 10a. Claim winners (Alice, Bob, Carol). Verify SPL allocation arrived
+    // at the bidder's ATA and bid_record fields are populated correctly.
+    for (const ctx of ctxs.slice(0, 3)) {
+      const bidderTokenAta = getAssociatedTokenAddressSync(
+        mint,
+        ctx.kp.publicKey
+      );
+      console.log(`claim_winner: ${ctx.name}`);
+      await program.methods
+        .claimWinner()
+        .accountsPartial({
+          bidder: ctx.kp.publicKey,
+          auction: auctionPda,
+          bidRecord: ctx.bidRecordPda,
+          escrowAuthority,
+          tokenEscrow,
+          bidderTokenAccount: bidderTokenAta,
+          tokenMint: mint,
+          solEscrow,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        })
+        .signers([ctx.kp])
+        .rpc({ skipPreflight: false, commitment: "confirmed" });
+
+      const tokenBal = (
+        await getTokenAccount(provider.connection, bidderTokenAta)
+      ).amount;
+      expect(tokenBal.toString()).to.equal(expectedWonQty[ctx.name].toString());
+
+      const recordAfter = await program.account.bidRecord.fetch(
+        ctx.bidRecordPda
+      );
+      expect(recordAfter.wonQuantity.toString()).to.equal(
+        expectedWonQty[ctx.name].toString()
+      );
+      expect(recordAfter.refundAmount.toString()).to.equal(
+        expectedRefund[ctx.name].toString()
+      );
+      expect(JSON.stringify(recordAfter.status)).to.equal(
+        JSON.stringify({ claimed: {} })
+      );
+    }
+
+    // 10b. Claim loser (Dave). Verify full refund recorded.
+    const dave = ctxs[3];
+    console.log("claim_loser: Dave");
+    await program.methods
+      .claimLoser()
+      .accountsPartial({
+        bidder: dave.kp.publicKey,
+        auction: auctionPda,
+        bidRecord: dave.bidRecordPda,
+        solEscrow,
+      })
+      .signers([dave.kp])
+      .rpc({ skipPreflight: false, commitment: "confirmed" });
+    const daveRecord = await program.account.bidRecord.fetch(dave.bidRecordPda);
+    expect(daveRecord.refundAmount.toString()).to.equal(
+      expectedRefund["Dave"].toString()
+    );
+    expect(JSON.stringify(daveRecord.status)).to.equal(
+      JSON.stringify({ claimed: {} })
+    );
+
+    // 10c. Claim issuer (gets 7 * 1000 = 7000 SOL proceeds, 0 unsold tokens).
+    console.log("claim_issuer");
+    await program.methods
+      .claimIssuer()
+      .accountsPartial({
+        issuer: owner.publicKey,
+        auction: auctionPda,
+        escrowAuthority,
+        tokenEscrow,
+        issuerTokenAccount: issuerAta.address,
+        tokenMint: mint,
+        solEscrow,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+      })
+      .signers([owner])
+      .rpc({ skipPreflight: false, commitment: "confirmed" });
+    const auctionAfter = await program.account.auction.fetch(auctionPda);
+    expect(auctionAfter.issuerClaimed).to.equal(true);
+
+    const issuerAtaFinal = (
+      await getTokenAccount(provider.connection, issuerAta.address)
+    ).amount;
+    // total_sold == total_supply, so unsold == 0; issuer ATA stays at 0.
+    expect(issuerAtaFinal.toString()).to.equal("0");
+
+    // sol_escrow should now hold only its rent-exempt minimum after all claims.
+    const solEscrowFinal = BigInt(
+      await provider.connection.getBalance(solEscrow)
+    );
+    const totalDisbursed = solEscrowBeforeClaims - solEscrowFinal;
+    // Sum of refunds + proceeds == sum of deposits (= 11200 lamports).
+    expect(totalDisbursed.toString()).to.equal(totalDeposited.toString());
+
+    // token_escrow should be empty (all 1000 went to winners).
+    const tokenEscrowFinal = (
+      await getTokenAccount(provider.connection, tokenEscrow)
+    ).amount;
+    expect(tokenEscrowFinal.toString()).to.equal("0");
+
+    console.log(
+      `Disbursed ${totalDisbursed} lamports == deposited ${totalDeposited} (Σ refund + Σ proceeds)`
+    );
   });
 
   // ===== helpers =====
@@ -292,10 +458,6 @@ describe("Cleared", () => {
         programId,
         Buffer.from(getCompDefAccOffset(circuit)).readUInt32LE()
       ),
-      // Explicit: Anchor's accountsPartial resolver auto-fills these from the
-      // IDL `address` constants on most ixs but not `submit_bid` (likely an
-      // ordering / init-account interaction). Passing them explicitly works
-      // for all three ixs and avoids the surprise.
       poolAccount: getFeePoolAccAddress(),
       clockAccount: getClockAccAddress(),
     };
@@ -312,13 +474,8 @@ describe("Cleared", () => {
       [baseSeed, program.programId.toBuffer(), offset],
       getArciumProgramId()
     )[0];
-
-    // Idempotency: skip if already initialized.
     const info = await provider.connection.getAccountInfo(compDefPda);
-    if (info !== null) {
-      console.log(`  (already initialized: ${circuit})`);
-      return;
-    }
+    if (info !== null) return;
 
     const mxeAccount = getMXEAccAddress(program.programId);
     const mxeAcc = await arciumProgram.account.mxeAccount.fetch(mxeAccount);
@@ -345,15 +502,12 @@ describe("Cleared", () => {
       })
       .signers([owner])
       .rpc({ commitment: "confirmed" });
-
-    console.log(`  using off-chain circuit source for ${circuit}`);
   }
 
   async function probeCompDefImmutability(
     owner: anchor.web3.Keypair,
     circuit: CircuitName
   ): Promise<void> {
-    console.log(`Probing comp-def immutability: ${circuit}`);
     const offsetBytes = getCompDefAccOffset(circuit);
     const offset = Buffer.from(offsetBytes).readUInt32LE();
     const mxeAccount = getMXEAccAddress(program.programId);
@@ -369,47 +523,13 @@ describe("Cleared", () => {
       )) as any;
 
     const sameSource = cloneSource(compDef.circuitSource);
-    const wrongHash = cloneSource(compDef.circuitSource);
-    wrongHash.offChain[0].hash[0] = wrongHash.offChain[0].hash[0] ^ 1;
-    const differentUrl = cloneSource(compDef.circuitSource);
-    differentUrl.offChain[0].source = `${differentUrl.offChain[0].source}?immutability_probe=1`;
-
-    const scenarios = [
-      ["same hash + same URL", sameSource],
-      ["different hash + same URL", wrongHash],
-      ["same hash + different URL", differentUrl],
-    ] as const;
-
-    for (const [label, source] of scenarios) {
-      const result = await tryInitComputationDefinition(
-        owner,
-        offset,
-        mxeAccount,
-        lutAddress,
-        compDefPda,
-        compDef,
-        source
-      );
-      console.log(`  ${label}: ${result}`);
-    }
-  }
-
-  async function tryInitComputationDefinition(
-    owner: anchor.web3.Keypair,
-    offset: number,
-    mxeAccount: PublicKey,
-    lutAddress: PublicKey,
-    compDefPda: PublicKey,
-    compDef: any,
-    source: any
-  ): Promise<string> {
     try {
-      const sig = await arciumProgram.methods
+      await arciumProgram.methods
         .initComputationDefinition(
           offset,
           program.programId,
           compDef.definition,
-          source,
+          sameSource,
           compDef.cuAmount,
           compDef.finalizationAuthority ?? null
         )
@@ -422,18 +542,8 @@ describe("Cleared", () => {
         })
         .signers([owner])
         .rpc({ skipPreflight: false, commitment: "confirmed" });
-      return `accepted (${sig})`;
-    } catch (e: any) {
-      const message = e.message ?? String(e);
-      const usefulLog = [...(e.logs ?? [])]
-        .reverse()
-        .find(
-          (line: string) =>
-            !line.includes("Instruction: InitComputationDefinition") &&
-            !line.includes("invoke") &&
-            !line.includes("consumed")
-        );
-      return `rejected (${usefulLog ?? message})`;
+    } catch (_) {
+      // expected: comp def already initialized -> rejected; fine.
     }
   }
 
@@ -452,7 +562,7 @@ async function getMXEPublicKeyWithRetry(
     try {
       const mxePublicKey = await getMXEPublicKey(provider, programId);
       if (mxePublicKey) return mxePublicKey;
-    } catch (e) {
+    } catch (_) {
       // ignore, will retry
     }
     if (attempt < maxRetries) {
