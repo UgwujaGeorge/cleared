@@ -1,101 +1,79 @@
-import Image from "next/image";
+import Link from "next/link";
 
-export default function Home() {
+export default function HomePage() {
   return (
-    <div className="grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20 font-[family-name:var(--font-geist-sans)]">
-      <main className="flex flex-col gap-8 row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="https://nextjs.org/icons/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="list-inside list-decimal text-sm text-center sm:text-left font-[family-name:var(--font-geist-mono)]">
-          <li className="mb-2">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] px-1 py-0.5 rounded font-semibold">
-              src/app/page.tsx
-            </code>
-            .
-          </li>
-          <li>Save and see your changes instantly.</li>
-        </ol>
-
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+    <div className="mx-auto flex max-w-5xl flex-col gap-24 px-6 py-20">
+      <section className="flex flex-col gap-6">
+        <span className="font-mono text-xs tracking-widest text-emerald-400">
+          UNIFORM-PRICE SEALED-BID — DEVNET
+        </span>
+        <h1 className="font-mono text-5xl font-bold tracking-tight md:text-6xl">
+          Fair-launch token auctions,
+          <br />
+          encrypted end-to-end.
+        </h1>
+        <p className="max-w-2xl text-lg text-muted-foreground">
+          Cleared lets Solana projects launch their tokens through encrypted
+          uniform-price sealed-bid auctions. Bids stay private through Arcium
+          MPC; every winner pays the same clearing price.
+        </p>
+        <div className="mt-2 flex flex-wrap gap-3">
+          <Link
+            href="/launch"
+            className="rounded-md bg-primary px-5 py-2.5 font-medium text-primary-foreground transition hover:opacity-90"
           >
-            <Image
-              className="dark:invert"
-              src="https://nextjs.org/icons/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:min-w-44"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+            Launch a token
+          </Link>
+          <Link
+            href="/auctions"
+            className="rounded-md border border-border px-5 py-2.5 font-medium hover:bg-accent"
           >
-            Read our docs
-          </a>
+            Browse auctions
+          </Link>
         </div>
-      </main>
-      <footer className="row-start-3 flex gap-6 flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
+      </section>
+
+      <section className="flex flex-col gap-8">
+        <h2 className="font-mono text-2xl font-semibold tracking-tight">
+          How it works
+        </h2>
+        <div className="grid gap-6 md:grid-cols-3">
+          <Step
+            n="01"
+            title="Issuer creates an auction"
+            body="Deposit the SPL supply into a per-auction escrow. Set min price, max bid per wallet, and a closing time."
           />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
+          <Step
+            n="02"
+            title="Bidders submit encrypted bids"
+            body="Each (price, quantity) is encrypted client-side via x25519 + RescueCipher, then accumulated by Arcium MPC. No one sees a bid until settlement."
           />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
+          <Step
+            n="03"
+            title="MPC settles a uniform price"
+            body="At close, the MPC sorts bids and reveals the clearing price. Winners pull tokens + SOL refund; losers pull a full refund; the issuer pulls proceeds."
           />
-          Go to nextjs.org →
-        </a>
-      </footer>
+        </div>
+      </section>
+
+      <section className="flex flex-col gap-4 rounded-lg border border-border bg-card p-6">
+        <h2 className="font-mono text-lg font-semibold">Why uniform-price?</h2>
+        <p className="text-sm text-muted-foreground">
+          The same mechanism the U.S. Treasury uses for bond auctions. Bidders
+          can&apos;t be sniped or front-run, and the issuer captures the true
+          market clearing price — not what the most aggressive bidder paid.
+        </p>
+      </section>
+    </div>
+  );
+}
+
+function Step({ n, title, body }: { n: string; title: string; body: string }) {
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border border-border bg-card p-5">
+      <span className="font-mono text-xs text-muted-foreground">{n}</span>
+      <h3 className="font-semibold">{title}</h3>
+      <p className="text-sm text-muted-foreground">{body}</p>
     </div>
   );
 }

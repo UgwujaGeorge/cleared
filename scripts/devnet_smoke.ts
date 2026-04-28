@@ -170,9 +170,17 @@ async function main() {
   for (let i = 0; i < bids.length; i++) {
     const b = bids[i];
     const maxSpend = b.price * b.quantity;
-    // Fund bidder enough for fees + max_spend + ATA rent.
-    const fundSig = await connection.requestAirdrop(b.kp.publicKey, LAMPORTS_PER_SOL / 100);
-    await connection.confirmTransaction(fundSig, "confirmed");
+    // Fund bidder from issuer instead of the faucet (1 SOL/day rate limit).
+    const fundIx = anchor.web3.SystemProgram.transfer({
+      fromPubkey: owner.publicKey,
+      toPubkey: b.kp.publicKey,
+      lamports: LAMPORTS_PER_SOL / 100,
+    });
+    const fundTx = new anchor.web3.Transaction().add(fundIx);
+    const fundSig = await provider.sendAndConfirm(fundTx, [owner], {
+      commitment: "confirmed",
+    });
+    void fundSig;
 
     const bidderPriv = x25519.utils.randomSecretKey();
     const bidderPub = x25519.getPublicKey(bidderPriv);
@@ -228,13 +236,19 @@ async function main() {
     });
   }
 
-  // === Wait for closes_at ===
+  // === Wait for closes_at (resilient to transient RPC socket drops) ===
   console.log(`\nWaiting for closes_at=${closesAt.toString()}...`);
   while (true) {
-    const s = await connection.getSlot("confirmed");
-    const t = await connection.getBlockTime(s);
-    if (t !== null && t >= closesAt.toNumber() + 1) break;
-    await new Promise((r) => setTimeout(r, 4000));
+    try {
+      const s = await connection.getSlot("confirmed");
+      const t = await connection.getBlockTime(s);
+      if (t !== null && t >= closesAt.toNumber() + 1) break;
+    } catch (err) {
+      console.log(
+        `  poll failed (${(err as Error).message}); retrying in 5s`
+      );
+    }
+    await new Promise((r) => setTimeout(r, 5000));
   }
 
   // === close_auction ===
