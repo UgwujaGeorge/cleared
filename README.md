@@ -102,4 +102,5 @@ Creates a fresh test mint, runs a 2-bidder Winner/Loser scenario, and asserts SP
 
 ## License
 
-MIT
+built by 
+Ugwuja Ebuka 
